@@ -1,0 +1,47 @@
+services:
+  airflow:
+    build:
+      context: .
+      dockerfile: docker/airflow/dockerfile
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - JAVA_HOME=/usr/lib/jvm/default-java
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./data/raw:/opt/airflow/data/raw
+      - ./data/processed:/opt/airflow/data/processed
+      - ./scripts:/opt/airflow/scripts
+      - ./tests:/opt/airflow/tests
+      - ${USERPROFILE}/.kaggle/kaggle.json:/home/airflow/.kaggle/kaggle.json:ro
+    ports:
+      - '8080:8080'
+    command: ['airflow', 'standalone']
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+  # restart: unless-stopped
+  downloader:
+    build:
+      context: .
+      dockerfile: docker/downloader/dockerfile
+    image: downloader
+    volumes:
+      - ${USERPROFILE}/.kaggle/kaggle.json:/root/.kaggle/kaggle.json:ro
+      - ./scripts/config.py:/app/scripts/config.py
+      - ./scripts/download.py:/app/scripts/download.py
+      - ./data/raw:/app/data/raw
+  spark_processor:
+    build:
+      context: .
+      dockerfile: docker/spark_processor/dockerfile
+    image: spark_processor
+    volumes:
+      - ./data/raw:/app/data/raw
+      - ./data/processed:/app/data/processed
+      - ./scripts/config.py:/app/scripts/config.py
+    environment:
+      - PYTHONUNBUFFERED=1

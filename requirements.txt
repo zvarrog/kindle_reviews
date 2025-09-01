@@ -1,0 +1,9 @@
+#run_download
+kaggle
+
+#dag
+apache-airflow
+
+#process_reviews_spark
+pyspark
+numpy
