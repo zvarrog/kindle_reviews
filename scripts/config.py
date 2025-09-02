@@ -17,6 +17,6 @@ CSV_PATH = RAW_DATA_DIR + "/" + CSV_NAME
 
 # Параметры обработки
 # Максимальное число отзывов на каждый класс звёзд (1-5)
-PER_CLASS_LIMIT = 10_000
+PER_CLASS_LIMIT = 20_000
 HASHING_TF_FEATURES = 4096
 SHUFFLE_PARTITIONS = 64

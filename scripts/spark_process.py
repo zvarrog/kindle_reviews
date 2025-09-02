@@ -119,21 +119,6 @@ else:
 
     clean = clean.withColumn("text_len", length(col("reviewText")))
     clean = clean.withColumn("word_count", size(split(col("reviewText"), " ")))
-
-    # TF-IDF
-    tokenizer = Tokenizer(inputCol="reviewText", outputCol="words")
-    wordsData = tokenizer.transform(clean)
-    hashingTF = HashingTF(
-        inputCol="words", outputCol="rawFeatures", numFeatures=HASHING_TF_FEATURES
-    )
-    featurizedData = hashingTF.transform(wordsData)
-    idf = IDF(inputCol="rawFeatures", outputCol="tfidfFeatures")
-    idfModel = idf.fit(featurizedData)
-    clean = idfModel.transform(featurizedData)
-    # После применения TF-IDF кэшируем, так как переиспользуем при множественных join
-    clean = clean.persist(StorageLevel.MEMORY_AND_DISK)
-    log.info("Признаков HashingTF: %d", HASHING_TF_FEATURES)
-
     # Частота слова 'kindle' в отзыве
     clean = clean.withColumn(
         "kindle_freq", size(split(lower(col("reviewText")), "kindle")) - 1
@@ -149,20 +134,6 @@ else:
         .otherwise(0),
     )
 
-    # Агрегации
-    user_stats = clean.groupBy("reviewerID").agg(
-        avg("text_len").alias("user_avg_len"),
-        count("reviewText").alias("user_review_count"),
-    )
-    item_stats = clean.groupBy("asin").agg(
-        avg("text_len").alias("item_avg_len"),
-        count("reviewText").alias("item_review_count"),
-    )
-    clean = clean.join(user_stats, on="reviewerID", how="left").join(
-        item_stats, on="asin", how="left"
-    )
-    log.info("После добавления агрегатов кол-во колонок: %d", len(clean.columns))
-
     # Делим на выборки
     train, val, test = clean.randomSplit([0.7, 0.15, 0.15], seed=42)
     tr_c, v_c, te_c = train.count(), val.count(), test.count()
@@ -172,6 +143,51 @@ else:
         v_c,
         te_c,
         tr_c + v_c + te_c,
+    )
+
+    # TF-IDF: фитим IDF только на train и применяем к val/test тем же моделям
+    tokenizer = Tokenizer(inputCol="reviewText", outputCol="words")
+    hashingTF = HashingTF(
+        inputCol="words", outputCol="rawFeatures", numFeatures=HASHING_TF_FEATURES
+    )
+    idf = IDF(inputCol="rawFeatures", outputCol="tfidfFeatures")
+
+    train_words = tokenizer.transform(train)
+    train_feat = hashingTF.transform(train_words)
+    idfModel = idf.fit(train_feat)
+    train = idfModel.transform(train_feat)
+
+    val = idfModel.transform(hashingTF.transform(tokenizer.transform(val)))
+    test = idfModel.transform(hashingTF.transform(tokenizer.transform(test)))
+
+    train = train.persist(StorageLevel.MEMORY_AND_DISK)
+    val = val.persist(StorageLevel.MEMORY_AND_DISK)
+    test = test.persist(StorageLevel.MEMORY_AND_DISK)
+    log.info("Признаков HashingTF: %d", HASHING_TF_FEATURES)
+
+    # Агрегации на train
+    user_stats = train.groupBy("reviewerID").agg(
+        avg("text_len").alias("user_avg_len"),
+        count("reviewText").alias("user_review_count"),
+    )
+    item_stats = train.groupBy("asin").agg(
+        avg("text_len").alias("item_avg_len"),
+        count("reviewText").alias("item_review_count"),
+    )
+
+    # Присоединяем агрегаты к каждому датасету
+    train = train.join(user_stats, on="reviewerID", how="left").join(
+        item_stats, on="asin", how="left"
+    )
+    val = val.join(user_stats, on="reviewerID", how="left").join(
+        item_stats, on="asin", how="left"
+    )
+    test = test.join(user_stats, on="reviewerID", how="left").join(
+        item_stats, on="asin", how="left"
+    )
+
+    log.info(
+        "После добавления агрегатов кол-во колонок в train: %d", len(train.columns)
     )
 
     train.write.mode("overwrite").parquet(TRAIN_PATH)
