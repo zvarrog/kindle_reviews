@@ -2,6 +2,10 @@
 .venv/
 .vscode/
 data/
+mlruns/
+model/
 artifacts/
 __pycache__/
 *.pyc
+*__pycache__
+*.pytest_cache

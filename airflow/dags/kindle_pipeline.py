@@ -23,4 +23,16 @@ with DAG(
         bash_command="cd /opt/airflow && python /opt/airflow/scripts/spark_process.py",
     )
 
-    download >> process
+    train = BashOperator(
+        task_id="train_model",
+        bash_command="cd /opt/airflow && python /opt/airflow/scripts/train.py",
+        env={
+            # Передаём FORCE_* флаги через окружение при необходимости
+            "FORCE_DOWNLOAD": "0",
+            "FORCE_PROCESS": "0",
+            "FORCE_TRAIN": "1",
+        },
+    )
+
+    download.set_downstream(process)
+    process.set_downstream(train)

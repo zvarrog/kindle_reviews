@@ -1,0 +1,15 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+COPY scripts/train.py scripts/config.py ./scripts/
+COPY data/processed ./data/processed
+
+# По умолчанию запускаем обучение; можно переопределить командой/аргументами compose
+CMD ["python", "scripts/train.py"]

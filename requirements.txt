@@ -1,9 +1,28 @@
 #run_download
 kaggle
+pandas
 
-#dag
+#airflow
 apache-airflow
 
 #process_reviews_spark
 pyspark
 numpy
+
+#train
+--extra-index-url https://download.pytorch.org/whl/cu121
+scikit-learn
+optuna
+mlflow
+joblib
+matplotlib
+torch==2.3.1+cu121
+transformers
+pytest
+
+#api
+fastapi
+uvicorn[standard]
+
+
+kagglehub

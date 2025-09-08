@@ -45,3 +45,40 @@ services:
       - ./scripts/config.py:/app/scripts/config.py
     environment:
       - PYTHONUNBUFFERED=1
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api/dockerfile
+    image: kindle_api
+    depends_on:
+      - spark_processor
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./model:/app/model:ro
+      - ./scripts/config.py:/app/scripts/config.py:ro
+  # Не запрашиваем GPU для API — убираем deploy.resources, чтобы контейнер стартовал
+  # (GPU нужен только для trainer; включайте GPU вручную, если система поддерживает nvidia-container-toolkit)
+
+  trainer:
+    build:
+      context: .
+      dockerfile: docker/trainer/dockerfile
+    image: kindle_trainer
+    volumes:
+      - ./data/processed:/app/data/processed
+      - ./model:/app/model
+      - ./scripts:/app/scripts
+      - ./optuna_study.db:/app/optuna_study.db
+      - ./mlruns:/app/mlruns
+    environment:
+      - FORCE_TRAIN=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+    # Для Docker Compose v2 (без Swarm):
+    # gpus: all

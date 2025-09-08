@@ -20,9 +20,11 @@ from pyspark.sql.functions import (
     size,
     lower,
     when,
+    regexp_replace,
+    substring,
 )
 from pyspark.sql.window import Window
-from pyspark.ml.feature import Tokenizer, HashingTF, IDF
+from pyspark.ml.feature import Tokenizer, CountVectorizer, IDF
 from pyspark import StorageLevel
 from config import (
     FORCE_PROCESS,
@@ -31,6 +33,8 @@ from config import (
     PER_CLASS_LIMIT,
     HASHING_TF_FEATURES,
     SHUFFLE_PARTITIONS,
+    MIN_DF,
+    MIN_TF,
 )
 
 TRAIN_PATH = PROCESSED_DATA_DIR + "/train.parquet"
@@ -51,16 +55,22 @@ if (
         PROCESSED_DATA_DIR,
     )
 else:
-    spark = (
-        SparkSession.builder.appName("KindleReviews")
-        .config("spark.driver.memory", "1g")
-        .config("spark.executor.memory", "1g")
-        .config("spark.sql.adaptive.enabled", "true")
-        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
-        .config("spark.sql.execution.arrow.pyspark.enabled", "true")
-        .getOrCreate()
-    )
+
+    # Создаём SparkSession (если скрипт запускается сам по себе)
+    try:
+        spark = (
+            SparkSession.builder.appName("KindleReviews")
+            .config("spark.driver.memory", "1g")
+            .config("spark.executor.memory", "1g")
+            .config("spark.sql.adaptive.enabled", "true")
+            .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+            .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+            .config("spark.sql.execution.arrow.pyspark.enabled", "true")
+            .getOrCreate()
+        )
+    except Exception:
+        # если SparkSession уже создан в окружении, просто получим текущий
+        spark = SparkSession.builder.getOrCreate()
 
     # Снижаем число shuffle партиций для средних объёмов
     try:
@@ -75,7 +85,6 @@ else:
         spark.conf.get("spark.sql.shuffle.partitions"),
     )
 
-    # Чтение CSV с возможной пустой первой колонкой (индекс) из-за начальной запятой
     df = spark.read.csv(
         CSV_PATH,
         header=True,
@@ -85,8 +94,46 @@ else:
         multiLine=True,
     )
 
-    log.info("Удаление индексного столбца")
-    df = df.drop(df.columns[0])
+    # Устойчивое удаление искусственного индексного столбца (leading comma / _c0 / BOM)
+    first_col = df.columns[0]
+    # нормализуем имя: убираем BOM и пробелы
+    if isinstance(first_col, str):
+        cleaned = first_col.strip()
+        if cleaned.startswith("\ufeff"):
+            cleaned = cleaned.lstrip("\ufeff")
+    else:
+        cleaned = first_col
+
+    expected_cols = [
+        "asin",
+        "helpful",
+        "overall",
+        "reviewText",
+        "reviewTime",
+        "reviewerID",
+        "reviewerName",
+        "summary",
+        "unixReviewTime",
+    ]
+
+    should_drop = False
+    # явно пустое имя или стандартное имя парсера
+    if cleaned in ("", "_c0"):
+        should_drop = True
+    # если на одну колонку больше, чем ожидается, и первый столбец не из ожидаемых
+    elif len(df.columns) == len(expected_cols) + 1 and cleaned not in expected_cols:
+        should_drop = True
+
+    if should_drop:
+        log.info("Удаление индексного столбца: raw=%r cleaned=%r", first_col, cleaned)
+        df = df.drop(first_col)
+        log.info("Новый header: %s", ", ".join(df.columns))
+    else:
+        log.info(
+            "Первый столбец валидный (raw=%r cleaned=%r) — пропускаю удаление",
+            first_col,
+            cleaned,
+        )
 
     # Оставляем только нужные колонки
     cols = [
@@ -98,8 +145,28 @@ else:
         "reviewTime",
     ]
     df = df.select(*cols)
-
-    log.info("Строк после селекта колонок: %s", df.count())
+    # Легкая очистка текста (truncate, lower, normalize symbols, remove html/url/non-latin, collapse spaces)
+    MAX_TEXT_CHARS = 2000
+    text_expr = lower(substring(col("reviewText"), 1, MAX_TEXT_CHARS))
+    # Удаляем невидимые пробелы/марки: zero-width space, BOM, NBSP
+    text_expr = regexp_replace(text_expr, r"[\u200b\ufeff\u00A0]", " ")
+    # Убираем HTML/URL
+    text_expr = regexp_replace(text_expr, r"<[^>]+>", " ")
+    text_expr = regexp_replace(text_expr, r"http\S+", " ")
+    # Нормализация типографских кавычек и тире
+    text_expr = regexp_replace(text_expr, r"[\u2018\u2019]", "'")
+    text_expr = regexp_replace(text_expr, r"[\u201C\u201D]", '"')
+    text_expr = regexp_replace(text_expr, r"[\u2013\u2014]", "-")
+    # Убираем типичные Kindle/ebook-метки, не несущие смысловой нагрузки
+    text_expr = regexp_replace(
+        text_expr,
+        r"\b(kindle edition|prime reading|whispersync|borrow(?:ed)? for free|free sample|look inside)\b",
+        " ",
+    )
+    # Только латиница и пробелы, схлопывание пробелов
+    text_expr = regexp_replace(text_expr, r"[^a-z ]", " ")
+    text_expr = regexp_replace(text_expr, r"\s+", " ")
+    df = df.withColumn("reviewText", text_expr)
 
     # Чистим данные: валидные тексты и оценки
     clean = df.filter((col("reviewText").isNotNull()) & (col("overall").isNotNull()))
@@ -145,25 +212,40 @@ else:
         tr_c + v_c + te_c,
     )
 
-    # TF-IDF: фитим IDF только на train и применяем к val/test тем же моделям
+    # TF-IDF: фитим векторизатор и IDF только на train и применяем к val/test тем же моделям
     tokenizer = Tokenizer(inputCol="reviewText", outputCol="words")
-    hashingTF = HashingTF(
-        inputCol="words", outputCol="rawFeatures", numFeatures=HASHING_TF_FEATURES
+    vectorizer = CountVectorizer(
+        inputCol="words",
+        outputCol="rawFeatures",
+        vocabSize=HASHING_TF_FEATURES,
+        minDF=MIN_DF,
+        minTF=MIN_TF,
     )
     idf = IDF(inputCol="rawFeatures", outputCol="tfidfFeatures")
 
     train_words = tokenizer.transform(train)
-    train_feat = hashingTF.transform(train_words)
+    vec_model = vectorizer.fit(train_words)
+    train_feat = vec_model.transform(train_words)
     idfModel = idf.fit(train_feat)
     train = idfModel.transform(train_feat)
 
-    val = idfModel.transform(hashingTF.transform(tokenizer.transform(val)))
-    test = idfModel.transform(hashingTF.transform(tokenizer.transform(test)))
+    val_words = tokenizer.transform(val)
+    val_feat = vec_model.transform(val_words)
+    val = idfModel.transform(val_feat)
+
+    test_words = tokenizer.transform(test)
+    test_feat = vec_model.transform(test_words)
+    test = idfModel.transform(test_feat)
 
     train = train.persist(StorageLevel.MEMORY_AND_DISK)
     val = val.persist(StorageLevel.MEMORY_AND_DISK)
     test = test.persist(StorageLevel.MEMORY_AND_DISK)
-    log.info("Признаков HashingTF: %d", HASHING_TF_FEATURES)
+    log.info(
+        "CountVectorizer: vocabSize<=%d, minDF=%s, minTF=%s",
+        HASHING_TF_FEATURES,
+        str(MIN_DF),
+        str(MIN_TF),
+    )
 
     # Агрегации на train
     user_stats = train.groupBy("reviewerID").agg(
