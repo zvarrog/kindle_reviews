@@ -12,13 +12,17 @@ numpy
 #train
 --extra-index-url https://download.pytorch.org/whl/cu121
 scikit-learn
-optuna
+# Use Optuna 4.5.0 to match the DB schema created by the Airflow container
+optuna==4.5.0
+# Align SQLAlchemy for Optuna 3.x
+SQLAlchemy>=1.4,<2.0
 mlflow
 joblib
 matplotlib
 torch==2.3.1+cu121
 transformers
 pytest
+psycopg2-binary
 
 #api
 fastapi

@@ -1,5 +1,5 @@
 from airflow import DAG
-from airflow.operators.bash_operator import BashOperator
+from airflow.operators.bash import BashOperator
 from datetime import datetime
 
 default_args = {
@@ -30,7 +30,9 @@ with DAG(
             # Передаём FORCE_* флаги через окружение при необходимости
             "FORCE_DOWNLOAD": "0",
             "FORCE_PROCESS": "0",
-            "FORCE_TRAIN": "1",
+            "FORCE_TRAIN": "0",  # по умолчанию пропускаем, если модель есть
+            # Optuna Postgres storage
+            "OPTUNA_STORAGE": "postgresql+psycopg2://admin:admin@postgres:5432/optuna",
         },
     )
 

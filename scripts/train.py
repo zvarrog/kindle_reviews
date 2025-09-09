@@ -169,7 +169,7 @@ except Exception as _dev_err:  # noqa: BLE001
 
 # ===== Constants =====
 EXPERIMENT_NAME = "kindle_classical_models"
-OPTUNA_STORAGE = "sqlite:///optuna_study.db"
+OPTUNA_STORAGE = os.environ.get("OPTUNA_STORAGE", "sqlite:///optuna_study.db")
 STUDY_BASE_NAME = "classical_text_models"
 SEED = 42
 EARLY_STOP_PATIENCE = 8
@@ -538,7 +538,7 @@ def load_splits() -> (
     return X_train, X_val, X_test, y_train, y_val, y_test
 
 
-def build_pipeline(trial: optuna.Trial, model_name: str) -> Pipeline:
+def build_pipeline(trial: optuna.Trial, model_name: str, fixed_solver: Optional[str] = None) -> Pipeline:
     """Строит sklearn Pipeline для trial.
 
     Состав:
@@ -653,20 +653,20 @@ def build_pipeline(trial: optuna.Trial, model_name: str) -> Pipeline:
 
     if model_name == "logreg":
         C = trial.suggest_float("logreg_C", 1e-4, 1e2, log=True)
-        solver = trial.suggest_categorical(
-            "logreg_solver", ["lbfgs", "liblinear", "saga"]
-        )  # noqa: E501
-        # допустимые penalty зависят от solver
+        # Если fixed_solver задан, фиксируем выбор в trial через single-choice
+        if fixed_solver is not None:
+            solver = trial.suggest_categorical("logreg_solver", [fixed_solver])
+        else:
+            solver = trial.suggest_categorical(
+                "logreg_solver", ["lbfgs", "liblinear", "saga"]
+            )  # noqa: E501
+        # Динамическое пространство: набор допустимых penalty зависит от выбранного solver.
         if solver == "lbfgs":
-            penalty = trial.suggest_categorical(
-                "logreg_penalty", ["l2"]
-            )  # lbfgs поддерживает только l2
+            penalty = trial.suggest_categorical("logreg_penalty", ["l2"])  # lbfgs
         elif solver == "liblinear":
             penalty = trial.suggest_categorical("logreg_penalty", ["l1", "l2"])  # OvR
         else:  # saga
-            penalty = trial.suggest_categorical(
-                "logreg_penalty", ["l1", "l2"]
-            )  # multinomial/ovr
+            penalty = trial.suggest_categorical("logreg_penalty", ["l1", "l2"])  # multinomial/ovr
         clf = LogisticRegression(
             max_iter=2500,
             C=C,
@@ -743,7 +743,7 @@ def log_confusion_matrix(y_true, y_pred, path: Path):
     plt.close(fig)
 
 
-def objective(trial: optuna.Trial, model_name: str, X_train, y_train, X_val, y_val):
+def objective(trial: optuna.Trial, model_name: str, X_train, y_train, X_val, y_val, fixed_solver: Optional[str] = None):
     trial.set_user_attr(
         "numeric_cols", [c for c in NUMERIC_COLS if c in X_train.columns]
     )
@@ -761,7 +761,7 @@ def objective(trial: optuna.Trial, model_name: str, X_train, y_train, X_val, y_v
                 for tr_idx, va_idx in skf.split(texts, y_train):
                     X_tr, X_va = texts[tr_idx], texts[va_idx]
                     y_tr, y_va = y_train[tr_idx], y_train[va_idx]
-                    pipe = build_pipeline(trial, model_name)
+                    pipe = build_pipeline(trial, model_name, fixed_solver)
                     pipe.fit(X_tr, y_tr)
                     preds_fold = pipe.predict(X_va)
                     f1_scores.append(f1_score(y_va, preds_fold, average="macro"))
@@ -769,7 +769,7 @@ def objective(trial: optuna.Trial, model_name: str, X_train, y_train, X_val, y_v
                 mlflow.log_metric("cv_f1_macro", mean_f1)
                 return mean_f1
             else:
-                clf_pipe = build_pipeline(trial, model_name)
+                clf_pipe = build_pipeline(trial, model_name, fixed_solver)
                 clf_pipe.fit(X_train["reviewText"], y_train)
                 preds = clf_pipe.predict(X_val["reviewText"])
                 metrics = compute_metrics(y_val, preds)
@@ -788,7 +788,7 @@ def objective(trial: optuna.Trial, model_name: str, X_train, y_train, X_val, y_v
         for tr_idx, val_idx in skf.split(X_train, y_train):
             X_tr, X_va = X_train.iloc[tr_idx], X_train.iloc[val_idx]
             y_tr, y_va = y_train[tr_idx], y_train[val_idx]
-            pipe = build_pipeline(trial, model_name)
+            pipe = build_pipeline(trial, model_name, fixed_solver)
             pipe.fit(X_tr, y_tr)
             preds_fold = pipe.predict(X_va)
             f1_scores.append(f1_score(y_va, preds_fold, average="macro"))
@@ -797,7 +797,7 @@ def objective(trial: optuna.Trial, model_name: str, X_train, y_train, X_val, y_v
         mlflow.log_metric("cv_f1_macro", mean_f1)
         return mean_f1
     else:
-        pipe = build_pipeline(trial, model_name)
+        pipe = build_pipeline(trial, model_name, fixed_solver)
         pipe.fit(X_train, y_train)
         preds = pipe.predict(X_val)
         metrics = compute_metrics(y_val, preds)
@@ -877,6 +877,8 @@ def run():
     model_dir.mkdir(parents=True, exist_ok=True)
     best_path = model_dir / "best_model.joblib"
 
+    log.info("FORCE_TRAIN=%s, best_model exists=%s", FORCE_TRAIN, best_path.exists())
+
     if best_path.exists() and not FORCE_TRAIN:
         log.info("Модель уже существует и FORCE_TRAIN=False — пропуск")
         return
@@ -930,9 +932,17 @@ def run():
 
         # Перебираем модели и оптимизируем каждую в своей study
         per_model_results: Dict[str, Dict[str, object]] = {}
+        # Расширяем цели поиска: для logreg создаём отдельные study по solver, чтобы избежать динамики дистрибуций в одной study
+        search_targets: List[Tuple[str, Optional[str]]] = []
         for model_name in MODEL_CHOICES:
+            if model_name == "logreg":
+                search_targets.extend([(model_name, "lbfgs"), (model_name, "liblinear"), (model_name, "saga")])
+            else:
+                search_targets.append((model_name, None))
+
+        for model_name, fixed_solver in search_targets:
             pruner = optuna.pruners.MedianPruner(n_warmup_steps=5)
-            study_name = f"{STUDY_BASE_NAME}_{model_name}_{_model_sig}"
+            study_name = f"{STUDY_BASE_NAME}_{model_name}{('_' + fixed_solver) if fixed_solver else ''}_{_model_sig}"
             with mlflow.start_run(nested=True, run_name=f"model={model_name}"):
                 study = optuna.create_study(
                     direction="maximize",
@@ -950,12 +960,9 @@ def run():
                     )
                 except Exception:
                     pass
-
                 def opt_obj(trial):
                     with mlflow.start_run(nested=True):
-                        return objective(
-                            trial, model_name, X_train, y_train, X_val, y_val
-                        )
+                        return objective(trial, model_name, X_train, y_train, X_val, y_val, fixed_solver)
 
                 try:
                     study.optimize(
@@ -973,11 +980,15 @@ def run():
                 if not study.best_trial or study.best_trial.value is None:
                     log.warning(f"{model_name}: нет успешных trial'ов — пропуск")
                 else:
-                    per_model_results[model_name] = {
+                    # сохраняем лучший результат по каждой модели (включая разные solvers) как максимум
+                    cur = per_model_results.get(model_name)
+                    new_entry = {
                         "best_value": study.best_value,
                         "best_params": study.best_trial.params,
                         "study_name": study_name,
                     }
+                    if cur is None or new_entry["best_value"] > cur["best_value"]:
+                        per_model_results[model_name] = new_entry
 
         if not per_model_results:
             log.error("Нет ни одного успешного результата оптимизации — выход")

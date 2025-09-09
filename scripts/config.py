@@ -1,9 +1,18 @@
 """Конфигурационные параметры для скачивания и обработки датасета Kindle Reviews."""
 
+import os
+
 # Если True — принудительно скачивать или обрабатывать данные
-FORCE_DOWNLOAD = True
-FORCE_PROCESS = True
-FORCE_TRAIN = True
+# Значения можно переопределить через переменные окружения (Airflow задаёт env в операторе)
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip() not in {"0", "false", "False", "no", "none", ""}
+
+FORCE_DOWNLOAD = _env_bool("FORCE_DOWNLOAD", False)
+FORCE_PROCESS = _env_bool("FORCE_PROCESS", False)
+FORCE_TRAIN = _env_bool("FORCE_TRAIN", False)
 
 
 # Параметры датасета и файлы внутри архива
@@ -39,4 +48,4 @@ SELECTED_MODELS = [
     "mlp",
     "distilbert",
 ]  # можно добавить "mlp", "distilbert" при необходимости
-OPTUNA_N_TRIALS = 40  # число trial'ов по умолчанию
+OPTUNA_N_TRIALS = int(os.environ.get("OPTUNA_N_TRIALS", "40"))  # число trial'ов по умолчанию
