@@ -2,6 +2,7 @@
 
 import os
 
+
 # Если True — принудительно скачивать или обрабатывать данные
 # Значения можно переопределить через переменные окружения (Airflow задаёт env в операторе)
 def _env_bool(name: str, default: bool) -> bool:
@@ -9,6 +10,7 @@ def _env_bool(name: str, default: bool) -> bool:
     if v is None:
         return default
     return v.strip() not in {"0", "false", "False", "no", "none", ""}
+
 
 FORCE_DOWNLOAD = _env_bool("FORCE_DOWNLOAD", False)
 FORCE_PROCESS = _env_bool("FORCE_PROCESS", False)
@@ -48,4 +50,6 @@ SELECTED_MODELS = [
     "mlp",
     "distilbert",
 ]  # можно добавить "mlp", "distilbert" при необходимости
-OPTUNA_N_TRIALS = int(os.environ.get("OPTUNA_N_TRIALS", "40"))  # число trial'ов по умолчанию
+OPTUNA_N_TRIALS = int(
+    os.environ.get("OPTUNA_N_TRIALS", "40")
+)  # число trial'ов по умолчанию

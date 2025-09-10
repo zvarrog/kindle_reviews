@@ -172,7 +172,7 @@ EXPERIMENT_NAME = "kindle_classical_models"
 OPTUNA_STORAGE = os.environ.get("OPTUNA_STORAGE", "sqlite:///optuna_study.db")
 STUDY_BASE_NAME = "classical_text_models"
 SEED = 42
-EARLY_STOP_PATIENCE = 8
+EARLY_STOP_PATIENCE = 13
 N_FOLDS: int = int(os.environ.get("CV_N_FOLDS", 1))  # если 1 – holdout
 OPTUNA_TIMEOUT_SEC = 3600  # ограничение общего времени оптимизации
 MEM_WARN_MB = float(
@@ -538,7 +538,9 @@ def load_splits() -> (
     return X_train, X_val, X_test, y_train, y_val, y_test
 
 
-def build_pipeline(trial: optuna.Trial, model_name: str, fixed_solver: Optional[str] = None) -> Pipeline:
+def build_pipeline(
+    trial: optuna.Trial, model_name: str, fixed_solver: Optional[str] = None
+) -> Pipeline:
     """Строит sklearn Pipeline для trial.
 
     Состав:
@@ -666,7 +668,9 @@ def build_pipeline(trial: optuna.Trial, model_name: str, fixed_solver: Optional[
         elif solver == "liblinear":
             penalty = trial.suggest_categorical("logreg_penalty", ["l1", "l2"])  # OvR
         else:  # saga
-            penalty = trial.suggest_categorical("logreg_penalty", ["l1", "l2"])  # multinomial/ovr
+            penalty = trial.suggest_categorical(
+                "logreg_penalty", ["l1", "l2"]
+            )  # multinomial/ovr
         clf = LogisticRegression(
             max_iter=2500,
             C=C,
@@ -743,7 +747,15 @@ def log_confusion_matrix(y_true, y_pred, path: Path):
     plt.close(fig)
 
 
-def objective(trial: optuna.Trial, model_name: str, X_train, y_train, X_val, y_val, fixed_solver: Optional[str] = None):
+def objective(
+    trial: optuna.Trial,
+    model_name: str,
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    fixed_solver: Optional[str] = None,
+):
     trial.set_user_attr(
         "numeric_cols", [c for c in NUMERIC_COLS if c in X_train.columns]
     )
@@ -936,7 +948,13 @@ def run():
         search_targets: List[Tuple[str, Optional[str]]] = []
         for model_name in MODEL_CHOICES:
             if model_name == "logreg":
-                search_targets.extend([(model_name, "lbfgs"), (model_name, "liblinear"), (model_name, "saga")])
+                search_targets.extend(
+                    [
+                        (model_name, "lbfgs"),
+                        (model_name, "liblinear"),
+                        (model_name, "saga"),
+                    ]
+                )
             else:
                 search_targets.append((model_name, None))
 
@@ -960,9 +978,18 @@ def run():
                     )
                 except Exception:
                     pass
+
                 def opt_obj(trial):
                     with mlflow.start_run(nested=True):
-                        return objective(trial, model_name, X_train, y_train, X_val, y_val, fixed_solver)
+                        return objective(
+                            trial,
+                            model_name,
+                            X_train,
+                            y_train,
+                            X_val,
+                            y_val,
+                            fixed_solver,
+                        )
 
                 try:
                     study.optimize(
