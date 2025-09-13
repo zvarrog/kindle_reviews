@@ -7,6 +7,7 @@ from scripts.models.kinds import ModelKind
 # Опциональная загрузка .env (безопасно: если python-dotenv не установлен, пропускаем)
 try:  # noqa: WPS501
     from dotenv import load_dotenv  # type: ignore
+
     load_dotenv()
 except ImportError:
     # Нет python-dotenv — просто пропускаем загрузку из .env
@@ -57,7 +58,7 @@ STUDY_BASE_NAME: str = os.getenv("STUDY_BASE_NAME", "kindle_optuna")
 
 # Доп. параметры для обратной совместимости и ускорения тестов
 N_FOLDS: int = int(os.getenv("N_FOLDS", "1"))  # k-fold валидация, по умолчанию 1
-TRAIN_DEVICE: str = os.getenv("TRAIN_DEVICE", "cpu")  # устройство для NN
+TRAIN_DEVICE: str = os.getenv("TRAIN_DEVICE", "cuda")  # устройство для NN
 EARLY_STOP_PATIENCE: int = int(os.getenv("EARLY_STOP_PATIENCE", "10"))
 OPTUNA_TIMEOUT_SEC: int = int(os.getenv("OPTUNA_TIMEOUT_SEC", "300"))
 

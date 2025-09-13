@@ -26,6 +26,7 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: 'postgresql+psycopg2://admin:admin@postgres:5432/airflow_meta'
       OPTUNA_STORAGE: 'postgresql+psycopg2://admin:admin@postgres:5432/optuna'
       JAVA_HOME: /usr/lib/jvm/default-java
+      PYTHONPATH: /opt/airflow
       FORCE_DOWNLOAD: '0'
       FORCE_PROCESS: '0'
       FORCE_TRAIN: '0'
@@ -51,6 +52,10 @@ services:
       for i in $(seq 1 30); do curl -sSf http://localhost:8080/health || true; sleep 2; done;
       echo 'Airflow UI: http://localhost:8080';
       airflow scheduler"
+    deploy:
+      resources:
+        limits:
+          memory: 6g
 
   api:
     build:

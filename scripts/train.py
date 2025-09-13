@@ -152,7 +152,7 @@ def build_pipeline(
 
     if model_kind is ModelKind.logreg:  # без SVD, расширяем max_features, float32
         text_max_features = trial.suggest_int(
-            "tfidf_max_features", 5000, 15000, step=1000
+            "tfidf_max_features", 1000, 6000, step=500
         )
         tfidf = TfidfVectorizer(
             max_features=text_max_features,
@@ -165,11 +165,11 @@ def build_pipeline(
         text_steps = [("tfidf", tfidf)]
     else:
         text_max_features = trial.suggest_int(
-            "tfidf_max_features", 5000, 15000, step=1000
+            "tfidf_max_features", 1000, 6000, step=500
         )
         use_svd = trial.suggest_categorical("use_svd", [False, True])
         if use_svd:
-            svd_components = trial.suggest_int("svd_components", 100, 300, step=50)
+            svd_components = trial.suggest_int("svd_components", 20, 100, step=20)
         tfidf = TfidfVectorizer(
             max_features=text_max_features,
             ngram_range=(1, 2),

@@ -4,8 +4,14 @@
 # ML стек (классические модели, трекинг)
 -r requirements-ml.txt
 
+# Spark для обработки данных
+-r requirements-spark.txt
+
+# Downloader для получения данных
+-r requirements-downloader.txt
+
 # Опционально: NLP/torch (раскомментируйте при необходимости)
-# -r requirements-nlp.txt
+-r requirements-nlp.txt
 
 # Dev инструменты и тесты (локально)
 -r requirements-dev.txt

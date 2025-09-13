@@ -304,8 +304,21 @@ def validate_parquet_file(
 
         # Проверка дубликатов
         if check_duplicates and len(df) > 0:
+            import numpy as np
+
             try:
-                duplicates = df.duplicated().sum()
+                # Преобразуем все столбцы с массивами в tuple
+                df_for_dupes = df.copy()
+                for col in df_for_dupes.columns:
+                    if (
+                        df_for_dupes[col]
+                        .apply(lambda x: isinstance(x, np.ndarray))
+                        .any()
+                    ):
+                        df_for_dupes[col] = df_for_dupes[col].apply(
+                            lambda x: tuple(x) if isinstance(x, np.ndarray) else x
+                        )
+                duplicates = df_for_dupes.duplicated().sum()
                 if duplicates > 0:
                     warnings.append(f"Найдено {duplicates} дублированных строк")
                     schema_info["duplicates"] = duplicates
@@ -404,26 +417,26 @@ def log_validation_results(results: Dict[str, DataValidationResult]) -> bool:
     all_valid = True
 
     for name, result in results.items():
-        log.info(f"\n📊 Валидация '{name}':")
-        log.info(f"  Статус: {'✅ Успешно' if result.is_valid else '❌ Ошибки'}")
+        log.info(f"\nВалидация '{name}':")
+        log.info(f"  Статус: {'Успешно' if result.is_valid else 'Ошибки'}")
 
         if result.errors:
             all_valid = False
             log.error(f"  Ошибки ({len(result.errors)}):")
             for error in result.errors:
-                log.error(f"    • {error}")
+                log.error(f"    - {error}")
 
         if result.warnings:
             log.warning(f"  Предупреждения ({len(result.warnings)}):")
             for warning in result.warnings:
-                log.warning(f"    • {warning}")
+                log.warning(f"    - {warning}")
 
         # Краткая статистика
         if "rows" in result.schema_info:
-            log.info(f"  📈 Строк: {result.schema_info['rows']:,}")
+            log.info(f"  Строк: {result.schema_info['rows']:,}")
         if "columns" in result.schema_info:
-            log.info(f"  📋 Колонок: {len(result.schema_info['columns'])}")
+            log.info(f"  Колонок: {len(result.schema_info['columns'])}")
         if "memory_usage_mb" in result.schema_info:
-            log.info(f"  💾 Память: {result.schema_info['memory_usage_mb']:.1f} MB")
+            log.info(f"  Память: {result.schema_info['memory_usage_mb']:.1f} MB")
 
     return all_valid
