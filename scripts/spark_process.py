@@ -26,9 +26,10 @@ from pyspark.sql.functions import (
 from pyspark.sql.window import Window
 from pyspark.ml.feature import Tokenizer, CountVectorizer, IDF
 from pyspark import StorageLevel
-from config import (
+from scripts.settings import (
     FORCE_PROCESS,
-    CSV_PATH,
+    RAW_DATA_DIR,
+    CSV_NAME,
     PROCESSED_DATA_DIR,
     PER_CLASS_LIMIT,
     HASHING_TF_FEATURES,
@@ -37,22 +38,25 @@ from config import (
     MIN_TF,
 )
 
-TRAIN_PATH = PROCESSED_DATA_DIR + "/train.parquet"
-VAL_PATH = PROCESSED_DATA_DIR + "/val.parquet"
-TEST_PATH = PROCESSED_DATA_DIR + "/test.parquet"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger(__name__)
+TRAIN_PATH = PROCESSED_DATA_DIR / "train.parquet"
+VAL_PATH = PROCESSED_DATA_DIR / "val.parquet"
+TEST_PATH = PROCESSED_DATA_DIR / "test.parquet"
+
+# Используем централизованную систему логирования (автоматическое определение среды)
+from .logging_config import setup_auto_logging
+
+log = setup_auto_logging()
 
 if (
     not FORCE_PROCESS
-    and Path(TRAIN_PATH).exists()
-    and Path(VAL_PATH).exists()
-    and Path(TEST_PATH).exists()
+    and TRAIN_PATH.exists()
+    and VAL_PATH.exists()
+    and TEST_PATH.exists()
 ):
     log.warning(
-        "Обработанные данные уже существуют в %s. Для форсированной обработки установите флаг FORCE_PROCESS = True в config.py.",
-        PROCESSED_DATA_DIR,
+        "Обработанные данные уже существуют в %s. Для форсированной обработки установите флаг FORCE_PROCESS = True.",
+        str(PROCESSED_DATA_DIR),
     )
 else:
 
@@ -86,7 +90,7 @@ else:
     )
 
     df = spark.read.csv(
-        CSV_PATH,
+        str(RAW_DATA_DIR / CSV_NAME),
         header=True,
         inferSchema=True,
         quote='"',
@@ -272,12 +276,32 @@ else:
         "После добавления агрегатов кол-во колонок в train: %d", len(train.columns)
     )
 
+    # Сохраняем данные
     train.write.mode("overwrite").parquet(TRAIN_PATH)
     val.write.mode("overwrite").parquet(VAL_PATH)
     test.write.mode("overwrite").parquet(TEST_PATH)
 
     log.info(
-        "Обработка завершена. Данные сохранены в %s",
+        "Данные сохранены в %s",
         str(Path(PROCESSED_DATA_DIR).resolve()),
     )
+
+    # Валидация сохранённых данных
+    log.info("🔍 Запуск валидации сохранённых parquet файлов...")
+    try:
+        # Используем pandas для валидации после записи Spark
+        from .data_validation import validate_parquet_dataset, log_validation_results
+
+        validation_results = validate_parquet_dataset(Path(PROCESSED_DATA_DIR))
+        all_valid = log_validation_results(validation_results)
+
+        if all_valid:
+            log.info("✅ Валидация сохранённых данных успешно завершена")
+        else:
+            log.warning("⚠️ Обнаружены проблемы в сохранённых данных")
+
+    except Exception as e:
+        log.warning(f"Ошибка валидации сохранённых данных: {e}")
+
+    log.info("Обработка завершена.")
     spark.stop()

@@ -1,32 +1,11 @@
-#run_download
-kaggle
-pandas
+# Базовые зависимости API/скриптов
+-r requirements-base.txt
 
-#airflow
-apache-airflow
+# ML стек (классические модели, трекинг)
+-r requirements-ml.txt
 
-#process_reviews_spark
-pyspark
-numpy
+# Опционально: NLP/torch (раскомментируйте при необходимости)
+# -r requirements-nlp.txt
 
-#train
---extra-index-url https://download.pytorch.org/whl/cu121
-scikit-learn
-# Use Optuna 4.5.0 to match the DB schema created by the Airflow container
-optuna==4.5.0
-# Align SQLAlchemy for Optuna 3.x
-SQLAlchemy>=1.4,<2.0
-mlflow
-joblib
-matplotlib
-torch==2.3.1+cu121
-transformers
-pytest
-psycopg2-binary
-
-#api
-fastapi
-uvicorn[standard]
-
-
-kagglehub
+# Dev инструменты и тесты (локально)
+-r requirements-dev.txt

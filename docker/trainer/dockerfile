@@ -1,15 +1,28 @@
-FROM python:3.11-slim
-
+FROM python:3.11-slim AS base
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+FROM base AS deps
+COPY requirements-base.txt requirements-ml.txt /app/
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r /app/requirements-base.txt -r /app/requirements-ml.txt
 
-COPY scripts/train.py scripts/config.py ./scripts/
-COPY data/processed ./data/processed
+FROM base AS runtime
+RUN useradd -m appuser
+USER appuser
+
+WORKDIR /app
+
+# Копируем только скрипты; данные должны монтироваться как volume
+COPY --chown=appuser:appuser scripts/ ./scripts/
+
+# Зависимости
+COPY --from=deps /usr/local/lib/python3.11 /usr/local/lib/python3.11
+COPY --from=deps /usr/local/bin /usr/local/bin
 
 # По умолчанию запускаем обучение; можно переопределить командой/аргументами compose
 CMD ["python", "scripts/train.py"]

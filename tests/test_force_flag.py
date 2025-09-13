@@ -1,8 +1,8 @@
 from pathlib import Path
 import importlib
 
-from scripts import config
+from scripts.settings import FORCE_TRAIN
 
 
 def test_force_flag_present():
-    assert hasattr(config, "FORCE_TRAIN")
+    assert FORCE_TRAIN is not None

@@ -9,6 +9,7 @@ services:
       - '5432:5432'
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U admin -d optuna']
       interval: 5s
@@ -19,19 +20,20 @@ services:
     build:
       context: .
       dockerfile: docker/airflow/dockerfile
-    # Используем отдельную БД airflow_meta для метаданных Airflow, чтобы не конфликтовать с Optuna
     environment:
       AIRFLOW__CORE__EXECUTOR: SequentialExecutor
       AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: 'postgresql+psycopg2://admin:admin@postgres:5432/airflow_meta'
       OPTUNA_STORAGE: 'postgresql+psycopg2://admin:admin@postgres:5432/optuna'
       JAVA_HOME: /usr/lib/jvm/default-java
+      FORCE_DOWNLOAD: '0'
+      FORCE_PROCESS: '0'
+      FORCE_TRAIN: '0'
     volumes:
       - ./airflow/dags:/opt/airflow/dags
+      - ./scripts:/opt/airflow/scripts:ro
       - ./data/raw:/opt/airflow/data/raw
       - ./data/processed:/opt/airflow/data/processed
-      - ./scripts:/opt/airflow/scripts
-      - ./tests:/opt/airflow/tests
       - ./model:/opt/airflow/model
       - ./mlruns:/opt/airflow/mlruns
       - ${USERPROFILE}/.kaggle/kaggle.json:/home/airflow/.kaggle/kaggle.json:ro
@@ -40,44 +42,15 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: [gpu]
-              driver: nvidia
-    command:
-      - bash
-      - -c
-      - |
-        set -e
-        airflow db migrate
-        airflow users list | grep -q admin@example.com || airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com
-        airflow webserver -p 8080 &
-        airflow scheduler
-
-  downloader:
-    build:
-      context: .
-      dockerfile: docker/downloader/dockerfile
-    image: downloader
-    volumes:
-      - ${USERPROFILE}/.kaggle/kaggle.json:/root/.kaggle/kaggle.json:ro
-      - ./scripts/config.py:/app/scripts/config.py
-      - ./scripts/download.py:/app/scripts/download.py
-      - ./data/raw:/app/data/raw
-
-  spark_processor:
-    build:
-      context: .
-      dockerfile: docker/spark_processor/dockerfile
-    image: spark_processor
-    volumes:
-      - ./data/raw:/app/data/raw
-      - ./data/processed:/app/data/processed
-      - ./scripts/config.py:/app/scripts/config.py
-    environment:
-      PYTHONUNBUFFERED: '1'
+    command: >-
+      bash -c "set -e;
+      airflow db migrate;
+      airflow users list | grep -q admin@example.com || airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com;
+      airflow webserver -p 8080 &
+      echo 'Инициализация Airflow...';
+      for i in $(seq 1 30); do curl -sSf http://localhost:8080/health || true; sleep 2; done;
+      echo 'Airflow UI: http://localhost:8080';
+      airflow scheduler"
 
   api:
     build:
@@ -85,35 +58,19 @@ services:
       dockerfile: docker/api/dockerfile
     image: kindle_api
     depends_on:
-      - spark_processor
+      airflow:
+        condition: service_started
     ports:
       - '8000:8000'
     volumes:
       - ./model:/app/model:ro
-      - ./scripts/config.py:/app/scripts/config.py:ro
-
-  trainer:
-    build:
-      context: .
-      dockerfile: docker/trainer/dockerfile
-    image: kindle_trainer
-    volumes:
-      - ./data/processed:/app/data/processed
-      - ./model:/app/model
-      - ./scripts:/app/scripts
-      - ./mlruns:/app/mlruns
-    environment:
-      FORCE_TRAIN: '0'
-      OPTUNA_STORAGE: postgresql+psycopg2://admin:admin@postgres:5432/optuna
-    depends_on:
-      postgres:
-        condition: service_healthy
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: [gpu]
-              driver: nvidia
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
 
 volumes:
   pgdata:

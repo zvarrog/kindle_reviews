@@ -1,14 +1,101 @@
-FROM python:3.11-slim
-
+FROM python:3.11-slim AS base
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
-COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-COPY scripts/api_service.py scripts/config.py ./scripts/
+# Этап зависимостей с кешированием
+FROM base AS deps
+COPY requirements-base.txt requirements-ml.txt /app/
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r /app/requirements-base.txt -r /app/requirements-ml.txt
+
+# Рантайм слой
+FROM base AS runtime
+
+# Non-root пользователь
+RUN groupadd -g 10001 appgroup && useradd -m -u 10001 -g 10001 appuser
+USER appuser
+
+WORKDIR /app
+
+# Копируем только необходимые файлы для рантайма API (артефакты модели монтируются томом)
+COPY --chown=appuser:appuser scripts/ ./scripts/
+
+# Устанавливаем зависимости из предыдущего слоя
+COPY --from=deps /usr/local/lib/python3.11 /usr/local/lib/python3.11
+COPY --from=deps /usr/local/bin /usr/local/bin
 
 EXPOSE 8000
 
-CMD ["uvicorn", "scripts.api_service:app", "--host", "0.0.0.0", "--port", "8000"]
+# HEALTHCHECK без curl: используем Python в однострочном режиме
+HEALTHCHECK --interval=30s --timeout=5s --retries=5 CMD python -c "import urllib.request,sys;\n\
+	\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+    \n\
+\n\
+    \n\
+\n\
+    \n\
+\n\
+\n\
+    \n\
+\n\
+    \n\
+    \n\
+\n\
+\n\
+\n\
+\n\
+    req=urllib.request.Request('http://127.0.0.1:8000/health');\n\
+    \n\
+\n\
+\n\
+\n\
+\n\
+\n\
+    \n\
+    \n\
+    \n\
+    \n\
+    \n\
+    r=urllib.request.urlopen(req, timeout=3);\n\
+    sys.exit(0 if getattr(r,'status',200)==200 else 1)" || exit 1
+
+CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "2", "-b", "0.0.0.0:8000", "scripts.api_service:app"]

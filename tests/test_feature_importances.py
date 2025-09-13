@@ -1,12 +1,14 @@
-import json
-from pathlib import Path
+import sys, os
+
+sys.path.append("..\\..")
+print(os.listdir(sys.path))
+
 from scripts.train import (
     _extract_feature_importances,
     build_pipeline,
     load_splits,
     NUMERIC_COLS,
 )
-import optuna
 
 
 class DummyTrial:

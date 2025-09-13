@@ -1,8 +1,18 @@
 FROM python:3.11-slim
-
-RUN apt-get update && pip install --no-cache-dir kaggle pandas
+ENV PYTHONDONTWRITEBYTECODE=1 \
+	PYTHONUNBUFFERED=1 \
+	PIP_DISABLE_PIP_VERSION_CHECK=1 \
+	PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
-COPY scripts/download.py scripts/config.py ./
+COPY requirements-downloader.txt /app/requirements-downloader.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+	pip install -r /app/requirements-downloader.txt
+
+# Non-root пользователь
+RUN useradd -m appuser
+USER appuser
+
+COPY --chown=appuser:appuser scripts/download.py ./
 
 ENTRYPOINT ["python", "download.py"]

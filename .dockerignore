@@ -1,0 +1,51 @@
+data/*
+mlruns/*
+model/*
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+optuna_study.db
+.mypy_cache/
+.pytest_cache/
+
+# VCS и локальные настройки
+.git
+.gitignore
+.gitattributes
+.env
+.env.*
+
+# Виртуальные окружения и кэш
+venv/
+.venv/
+env/
+.python-version
+pip-wheel-metadata/
+
+# IDE/OS мусор
+.DS_Store
+.vscode/
+.idea/
+
+# Тесты/документация/ноутбуки (в образы не нужны)
+tests/
+notebooks/
+docs/
+*.ipynb
+
+# Сборочные артефакты
+build/
+dist/
+*.egg-info/
+htmlcov/
+.coverage
+coverage.xml
+
+# Данные и артефакты (в контейнеры монтируем как volume)
+artifacts/
+data/**/*.parquet
+data/**/*.csv
+data/**/*.zip
+data/**/*.gz

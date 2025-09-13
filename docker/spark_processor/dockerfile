@@ -1,10 +1,24 @@
 FROM openjdk:11-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+	PYTHONUNBUFFERED=1 \
+	PIP_DISABLE_PIP_VERSION_CHECK=1 \
+	PIP_NO_CACHE_DIR=1
+
 WORKDIR /app
+COPY requirements-spark.txt /app/requirements-spark.txt
 
-RUN apt-get update && apt-get install -y python3-pip && rm -rf /var/lib/apt/lists/*
-RUN pip3 install --no-cache-dir pyspark numpy
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends python3 python3-pip python3-venv \
+	&& rm -rf /var/lib/apt/lists/*
 
-COPY scripts/spark_process.py scripts/config.py ./
+RUN --mount=type=cache,target=/root/.cache/pip \
+	pip3 install -r /app/requirements-spark.txt
+
+# Non-root пользователь
+RUN useradd -m appuser
+USER appuser
+
+COPY --chown=appuser:appuser scripts/spark_process.py ./
 
 CMD ["python3", "spark_process.py"]

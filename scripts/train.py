@@ -15,531 +15,75 @@
 """
 
 from pathlib import Path
-import logging
 import json
+import joblib
 import hashlib
 import os
 import time
 import random
-import joblib
-from typing import Tuple, Dict, List, Optional
-
+from typing import Optional, Dict, Tuple, List
 import numpy as np
 import pandas as pd
-import mlflow
 import optuna
-
-from sklearn.base import TransformerMixin, BaseEstimator, ClassifierMixin
-from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
-from sklearn.decomposition import TruncatedSVD
+import mlflow
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
 from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    confusion_matrix,
-    classification_report,
-)
-from config import (
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from scripts.settings import (
+    SEED,
     PROCESSED_DATA_DIR,
     MODEL_DIR,
     FORCE_TRAIN,
-    SELECTED_MODELS,
     OPTUNA_N_TRIALS,
+    OPTUNA_STORAGE,
+    log,
+    SELECTED_MODEL_KINDS,
+    STUDY_BASE_NAME,
+    N_FOLDS,
+    TRAIN_DEVICE,
+    EARLY_STOP_PATIENCE,
+    OPTUNA_TIMEOUT_SEC,
 )
+from scripts.train_modules.data_loading import load_splits
+from scripts.train_modules.feature_space import NUMERIC_COLS, DenseTransformer
+from scripts.train_modules.models import SimpleMLP
+from scripts.models.distilbert import DistilBertClassifier
+from scripts.models.kinds import ModelKind
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger(__name__)
+from scripts.train_modules.tuning import objective, run_optuna_study
+from scripts.train_modules.evaluation import (
+    compute_metrics,
+    log_confusion_matrix,
+    get_classification_report,
+)
+from sklearn.metrics import (
+    f1_score,
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+)
+import sklearn
 
-# ===== Optional heavy deps (кэшируем один раз) =====
-try:  # noqa: WPS501
-    import torch as _TORCH  # type: ignore
-except Exception:  # noqa: BLE001
-    _TORCH = None  # type: ignore
-
-try:  # noqa: WPS501
-    from transformers import AutoTokenizer as _AutoTokenizer, AutoModel as _AutoModel  # type: ignore
-except Exception:  # noqa: BLE001
-    _AutoTokenizer = None  # type: ignore
-    _AutoModel = None  # type: ignore
-
-
-# ===== Device helper =====
-def _select_device(requested: Optional[str] = None) -> str:
-    """Выбор устройства с логированием причин fallback.
-
-    Логика:
-      1. Если передано явно (аргумент или ENV MODEL_DEVICE), пробуем его.
-      2. Иначе cuda если доступна, иначе cpu.
-    Возвращает строку ('cuda'|'cpu').
-    """
-    try:  # локальный импорт torch только при наличии
-        import torch  # noqa: WPS433
-    except Exception:  # noqa: BLE001
-        log.warning("torch не установлен — использую cpu")
-        return "cpu"
-
-    env_req = os.environ.get("MODEL_DEVICE")
-    if requested is None and env_req:
-        requested = env_req.strip().lower()
-
-    if requested:
-        if requested.startswith("cuda"):
-            if torch.cuda.is_available():
-                return "cuda"
-            log.warning(
-                "Запрошено устройство '%s', но torch.cuda.is_available()=False. Переход на cpu.",
-                requested,
-            )
-            return "cpu"
-        if requested in {"cpu", "mps"}:
-            if requested == "mps":
-                if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                    return "mps"  # (на macOS)
-                log.warning("Запрошено mps, но оно недоступно — cpu")
-                return "cpu"
-            return "cpu"
-        log.warning("Неизвестное устройство '%s' — cpu", requested)
-        return "cpu"
-
-    # Автовыбор
-    if torch.cuda.is_available():
-        return "cuda"
-    # (не добавляем MPS для Windows)
-    return "cpu"
-
-
-def _gpu_env_summary() -> Dict[str, Optional[str]]:
-    """Возвращает информацию об окружающей среде GPU (без жёстких зависимостей)."""
-    info: Dict[str, Optional[str]] = {
-        "torch_installed": None,
-        "cuda_available": None,
-        "cuda_device_count": None,
-        "cuda_device0_name": None,
-        "selected_device": None,
-        "env_MODEL_DEVICE": os.environ.get("MODEL_DEVICE"),
-        "env_REQUIRE_GPU": os.environ.get("REQUIRE_GPU"),
-    }
-    try:  # noqa: WPS501
-        import torch  # noqa: WPS433
-
-        info["torch_installed"] = torch.__version__
-        info["cuda_available"] = str(torch.cuda.is_available())
-        if torch.cuda.is_available():
-            info["cuda_device_count"] = str(torch.cuda.device_count())
-            try:  # отдельный перехват имени (иногда падает)
-                info["cuda_device0_name"] = torch.cuda.get_device_name(0)
-            except Exception:  # noqa: BLE001
-                pass
-    except Exception:  # noqa: BLE001
-        info["torch_installed"] = "no"
-    return info
-
-
-def _resolve_training_device() -> str:
-    """Определяем устройство один раз с учётом ENV и REQUIRE_GPU.
-
-    ENV:
-      MODEL_DEVICE = cpu|cuda (приоритет)
-      REQUIRE_GPU = 1  -> если GPU недоступна, выбрасываем RuntimeError.
-    """
-    requested = os.environ.get("MODEL_DEVICE")
-    device = _select_device(requested)
-    summary = _gpu_env_summary()
-    summary["selected_device"] = device
-    log.info("GPU summary: %s", summary)
-    if os.environ.get("REQUIRE_GPU") == "1" and device != "cuda":
-        raise RuntimeError(
-            "REQUIRE_GPU=1, но CUDA недоступна или не выбрана. summary=" + str(summary)
-        )
-    return device
-
-
-# Определяем устройство один раз (глобально для всех моделей)
-try:  # noqa: WPS501
-    TRAIN_DEVICE = _resolve_training_device()
-except Exception as _dev_err:  # noqa: BLE001
-    log.warning("Не удалось определить GPU устройство (%s) — fallback cpu", _dev_err)
-    TRAIN_DEVICE = "cpu"
-
-
-# ===== Constants =====
-EXPERIMENT_NAME = "kindle_classical_models"
-OPTUNA_STORAGE = os.environ.get("OPTUNA_STORAGE", "sqlite:///optuna_study.db")
-STUDY_BASE_NAME = "classical_text_models"
-SEED = 42
-EARLY_STOP_PATIENCE = 13
-N_FOLDS: int = int(os.environ.get("CV_N_FOLDS", 1))  # если 1 – holdout
-OPTUNA_TIMEOUT_SEC = 3600  # ограничение общего времени оптимизации
-MEM_WARN_MB = float(
-    os.environ.get("DENSE_MEM_WARN_MB", 1024)
-)  # предупреждение при конвертации > N MB
-
-NUMERIC_COLS = [
-    "text_len",
-    "word_count",
-    "kindle_freq",
-    "sentiment",
-    "user_avg_len",
-    "user_review_count",
-    "item_avg_len",
-    "item_review_count",
-]
-
-# Dynamic model list & study name
-MODEL_CHOICES = SELECTED_MODELS
+MODEL_CHOICES: List[ModelKind] = SELECTED_MODEL_KINDS
 SEARCH_SPACE_VERSION = "v2"
+EXPERIMENT_NAME: str = os.environ.get("MLFLOW_EXPERIMENT_NAME", "kindle_experiment")
+
 _model_sig = hashlib.md5(
-    (",".join(MODEL_CHOICES) + "|" + SEARCH_SPACE_VERSION).encode("utf-8")
+    (",".join([m.value for m in MODEL_CHOICES]) + "|" + SEARCH_SPACE_VERSION).encode(
+        "utf-8"
+    )
 ).hexdigest()[:8]
 OPTUNA_STUDY_NAME = f"{STUDY_BASE_NAME}_{_model_sig}"
 
 
-class SimpleMLP(BaseEstimator, ClassifierMixin):
-    """Простейшая MLP (sklearn-совместимая) поверх плотных признаков.
-
-    Ожидает на входе numpy массив (поэтому применима после DenseTransformer или когда preprocessor выдаёт dense).
-    Использует PyTorch только если доступен.
-    """
-
-    def __init__(
-        self,
-        hidden_dim: int = 128,
-        epochs: int = 5,
-        lr: float = 1e-3,
-        batch_size: int = 256,
-        seed: int = SEED,
-        device: Optional[str] = None,
-    ):
-        self.hidden_dim = hidden_dim
-        self.epochs = epochs
-        self.lr = lr
-        self.batch_size = batch_size
-        self.seed = seed
-        self._fitted = False
-        self._classes_: Optional[np.ndarray] = None
-        self._model = None
-        self._device = device  # 'cuda' | 'cpu' | None(auto)
-        # Мягкая ранняя проверка зависимостей
-        if _TORCH is None:
-            log.warning(
-                "SimpleMLP: torch не установлен — модель будет недоступна при fit()"
-            )
-
-    def fit(self, X, y):  # type: ignore[override]
-        if _TORCH is None:
-            raise ImportError("Для SimpleMLP требуется пакет torch. Установите torch.")
-        from torch import nn  # type: ignore
-
-        _TORCH.Generator().manual_seed(self.seed)
-        device_str = _select_device(self._device)
-        device = _TORCH.device(device_str)
-        try:
-            if device_str == "cpu":
-                log.info(
-                    "SimpleMLP: выбран cpu (cuda.is_available()=%s, env MODEL_DEVICE=%s)",
-                    getattr(_TORCH.cuda, "is_available", lambda: False)(),
-                    os.environ.get("MODEL_DEVICE"),
-                )
-            else:
-                log.info("SimpleMLP использует устройство: %s", device)
-        except Exception:  # noqa: BLE001
-            log.info("SimpleMLP использует устройство: %s", device)
-        # Label encoding (важно: исходные метки могут быть 1..5, а не 0..N-1)
-        unique_labels = np.unique(y)
-        self._classes_ = unique_labels  # сохраняем порядок возрастания
-        label2idx = {lab: i for i, lab in enumerate(unique_labels)}
-        y_idx = np.vectorize(label2idx.get)(y).astype(int)
-
-        X_ = _TORCH.tensor(X.astype(np.float32), device=device)
-        y_ = _TORCH.tensor(y_idx, device=device)
-        in_dim = X_.shape[1]
-        n_classes = len(unique_labels)
-        model = nn.Sequential(
-            nn.Linear(in_dim, self.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(self.hidden_dim, n_classes),
-        )
-        model.to(device)
-        opt = _TORCH.optim.Adam(model.parameters(), lr=self.lr)
-        loss_fn = nn.CrossEntropyLoss()
-        model.train()
-        for _ in range(self.epochs):
-            for i in range(0, len(X_), self.batch_size):
-                xb = X_[i : i + self.batch_size]
-                yb = y_[i : i + self.batch_size]
-                opt.zero_grad()
-                out = model(xb)
-                loss = loss_fn(out, yb)
-                loss.backward()
-                opt.step()
-        self._model = model
-        self._device_actual = device
-        self._fitted = True
-        return self
-
-    def predict(self, X):  # type: ignore[override]
-        self._ensure_fitted()
-        if _TORCH is None:
-            raise RuntimeError("torch недоступен во время predict")
-        with _TORCH.no_grad():
-            device = getattr(self, "_device_actual", _TORCH.device("cpu"))
-            t = _TORCH.tensor(X.astype(np.float32), device=device)
-            logits = self._model(t)
-            pred_idx = logits.argmax(dim=1).cpu().numpy()
-        # обратное преобразование к исходным меткам
-        return self._classes_[pred_idx]
-
-    def _ensure_fitted(self):  # noqa: D401
-        if not self._fitted:
-            raise RuntimeError("SimpleMLP не обучена")
-
-
-class DistilBertClassifier(BaseEstimator, ClassifierMixin):
-    """Лёгкая обёртка DistilBERT: замороженный encoder + линейная голова.
-
-    Вход — тексты (list/ndarray/Series). Опционально добавляем биграммы к тексту.
-    """
-
-    def __init__(
-        self,
-        epochs: int = 2,
-        lr: float = 2e-5,
-        max_len: int = 160,
-        batch_size: int = 16,
-        seed: int = SEED,
-        device: Optional[str] = None,
-        use_bigrams: bool = False,
-    ) -> None:
-        self.epochs = epochs
-        self.lr = lr
-        self.max_len = max_len
-        self.batch_size = batch_size
-        self.seed = seed
-        self._fitted = False
-        self._tokenizer: Optional[object] = None
-        self._base_model: Optional[object] = None
-        self._head: Optional[object] = None
-        self._device = device
-        self._device_actual: Optional[object] = None
-        self._classes_: Optional[np.ndarray] = None
-        self.use_bigrams = use_bigrams
-        if _TORCH is None or _AutoTokenizer is None or _AutoModel is None:
-            log.warning(
-                "DistilBertClassifier: torch/transformers не установлены — модель будет пропущена"
-            )
-
-    @staticmethod
-    def _augment_texts(texts):
-        def _augment_bigrams(s: str) -> str:
-            ws = [w for w in s.split() if w and w not in ENGLISH_STOP_WORDS]
-            bigrams = [f"{ws[i]}_{ws[i+1]}" for i in range(len(ws) - 1)]
-            return s + (" " + " ".join(bigrams[:20]) if bigrams else "")
-
-        return np.array([_augment_bigrams(t) for t in texts])
-
-    def fit(self, X, y):  # type: ignore[override]
-        texts = X if isinstance(X, (list, np.ndarray, pd.Series)) else X.values
-        if self.use_bigrams:
-            texts = self._augment_texts(texts)
-        if _TORCH is None or _AutoTokenizer is None or _AutoModel is None:
-            raise ImportError(
-                "Для DistilBertClassifier нужны пакеты torch и transformers. Установите их."
-            )
-        from torch import nn  # type: ignore
-
-        _TORCH.manual_seed(self.seed)
-        tokenizer = _AutoTokenizer.from_pretrained("distilbert-base-uncased")
-        base_model = _AutoModel.from_pretrained("distilbert-base-uncased")
-        device_str = _select_device(self._device)
-        device = _TORCH.device(device_str)
-        try:
-            if device_str == "cpu":
-                log.info(
-                    "DistilBERT: выбран cpu (cuda.is_available()=%s, env MODEL_DEVICE=%s)",
-                    _TORCH.cuda.is_available(),
-                    os.environ.get("MODEL_DEVICE"),
-                )
-            else:
-                log.info("DistilBERT использует устройство: %s", device)
-        except Exception:  # noqa: BLE001
-            log.info("DistilBERT использует устройство: %s", device)
-
-        for p in base_model.parameters():
-            p.requires_grad = False
-
-        unique_labels = np.unique(y)
-        self._classes_ = unique_labels
-        label2idx = {lab: i for i, lab in enumerate(unique_labels)}
-
-        hidden = base_model.config.hidden_size
-        n_classes = len(unique_labels)
-        head = nn.Linear(hidden, n_classes).to(device)
-        base_model.to(device)
-        optimizer = _TORCH.optim.Adam(head.parameters(), lr=self.lr)
-        loss_fn = nn.CrossEntropyLoss()
-        base_model.eval()
-        head.train()
-
-        def batch_iter():
-            for i in range(0, len(texts), self.batch_size):
-                yield texts[i : i + self.batch_size], y[i : i + self.batch_size]
-
-        for _ in range(self.epochs):
-            for bt, by_raw in batch_iter():
-                by = np.vectorize(label2idx.get)(by_raw).astype(int)
-                enc = tokenizer(
-                    list(bt),
-                    truncation=True,
-                    padding=True,
-                    max_length=self.max_len,
-                    return_tensors="pt",
-                )
-                enc = {k: v.to(device) for k, v in enc.items()}
-                with _TORCH.no_grad():
-                    out = base_model(**enc)
-                    cls = out.last_hidden_state[:, 0]
-                logits = head(cls)
-                loss = loss_fn(
-                    logits, _TORCH.tensor(by, dtype=_TORCH.long, device=device)
-                )
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-        self._tokenizer = tokenizer
-        self._base_model = base_model
-        self._head = head.eval()
-        self._device_actual = device
-        self._fitted = True
-        return self
-
-    def predict(self, X):  # type: ignore[override]
-        texts = X if isinstance(X, (list, np.ndarray, pd.Series)) else X.values
-        if self.use_bigrams:
-            texts = self._augment_texts(texts)
-        self._ensure()
-        if _TORCH is None:
-            raise RuntimeError("torch недоступен во время predict")
-        preds: List[int] = []
-        device = getattr(self, "_device_actual", _TORCH.device("cpu"))
-        for i in range(0, len(texts), self.batch_size):
-            batch = texts[i : i + self.batch_size]
-            enc = self._tokenizer(
-                list(batch),
-                truncation=True,
-                padding=True,
-                max_length=self.max_len,
-                return_tensors="pt",
-            )
-            enc = {k: v.to(device) for k, v in enc.items()}
-            with _TORCH.no_grad():
-                out = self._base_model(**enc)
-                cls = out.last_hidden_state[:, 0]
-                logits = self._head(cls)
-                preds.extend(logits.argmax(dim=1).cpu().numpy())
-        preds = np.array(preds)
-        return self._classes_[preds]
-
-    def _ensure(self) -> None:
-        if not self._fitted:
-            raise RuntimeError("DistilBertClassifier не обучен")
-
-
-def set_seeds(seed: int = SEED):
-    random.seed(seed)
-    np.random.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-
-
-class DenseTransformer(TransformerMixin, BaseEstimator):
-    """Превращает scipy sparse в dense numpy (для HistGradientBoosting) + контроль памяти."""
-
-    def fit(self, _X, _y=None):
-        return self
-
-    def transform(self, X):  # noqa: D401
-        if hasattr(X, "toarray"):
-            arr = X.toarray()
-        else:
-            arr = X
-        size_mb = arr.nbytes / (1024 * 1024)
-        if size_mb > MEM_WARN_MB:
-            log.warning(
-                "DenseTransformer: размер dense=%.1f MB > %.0f MB (риск памяти)",
-                size_mb,
-                MEM_WARN_MB,
-            )
-        return arr
-
-
-def load_splits() -> (
-    Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, np.ndarray, np.ndarray, np.ndarray]
-):
-    """Загружает сплиты; если отсутствуют val/test — формирует стратифицированно."""
-    from sklearn.model_selection import train_test_split
-
-    base = Path(PROCESSED_DATA_DIR)
-    train_p = base / "train.parquet"
-    val_p = base / "val.parquet"
-    test_p = base / "test.parquet"
-    if not train_p.exists():
-        raise FileNotFoundError(f"Нет train.parquet: {train_p}")
-    df_train = pd.read_parquet(train_p)
-    if not {"reviewText", "overall"}.issubset(df_train.columns):
-        raise KeyError("Ожидаются колонки 'reviewText' и 'overall'")
-
-    frames = {"train": df_train}
-    if val_p.exists():
-        frames["val"] = pd.read_parquet(val_p)
-    if test_p.exists():
-        frames["test"] = pd.read_parquet(test_p)
-
-    if "val" not in frames or "test" not in frames:
-        # Объединяем всё и создаём 70/15/15 стратифицированно
-        full = df_train.copy()
-        if "val" in frames:
-            full = pd.concat([full, frames["val"]], ignore_index=True)
-        if "test" in frames:
-            full = pd.concat([full, frames["test"]], ignore_index=True)
-        full = full.dropna(subset=["reviewText", "overall"])
-        y_full = full["overall"].astype(int)
-        temp_X, X_test, temp_y, y_test = train_test_split(
-            full, y_full, test_size=0.15, stratify=y_full, random_state=SEED
-        )
-        X_train, X_val, y_train, y_val = train_test_split(
-            temp_X, temp_y, test_size=0.17647, stratify=temp_y, random_state=SEED
-        )  # 0.17647 * 0.85 ≈ 0.15
-    else:
-        X_train = frames["train"]
-        X_val = frames["val"]
-        X_test = frames["test"]
-        y_train = X_train["overall"].astype(int)
-        y_val = X_val["overall"].astype(int)
-        y_test = X_test["overall"].astype(int)
-
-    def clean(df: pd.DataFrame):
-        keep = ["reviewText", "overall"] + [c for c in NUMERIC_COLS if c in df.columns]
-        return df[keep].dropna(subset=["reviewText", "overall"])
-
-    X_train = clean(X_train)
-    X_val = clean(X_val)
-    X_test = clean(X_test)
-    y_train = X_train["overall"].astype(int).values
-    y_val = X_val["overall"].astype(int).values
-    y_test = X_test["overall"].astype(int).values
-    X_train = X_train.drop(columns=["overall"])
-    X_val = X_val.drop(columns=["overall"])
-    X_test = X_test.drop(columns=["overall"])
-    return X_train, X_val, X_test, y_train, y_val, y_test
-
-
 def build_pipeline(
-    trial: optuna.Trial, model_name: str, fixed_solver: Optional[str] = None
+    trial: optuna.Trial, model_name, fixed_solver: Optional[str] = None
 ) -> Pipeline:
     """Строит sklearn Pipeline для trial.
 
@@ -548,8 +92,14 @@ def build_pipeline(
       - (опц.) DenseTransformer для hist_gb
       - Финальная модель
     """
+    # Приводим имя модели к enum (обратная совместимость со строками)
+    model_kind: ModelKind
+    if isinstance(model_name, ModelKind):
+        model_kind = model_name
+    else:
+        model_kind = ModelKind(str(model_name))
     # DistilBERT отдельный (без TF-IDF)
-    if model_name == "distilbert":
+    if model_kind is ModelKind.distilbert:
         epochs = trial.suggest_int("db_epochs", 1, 2)
         lr = trial.suggest_float("db_lr", 1e-5, 5e-5, log=True)
         max_len = trial.suggest_int("db_max_len", 96, 192, step=32)
@@ -570,9 +120,11 @@ def build_pipeline(
         if not use_stemming:
             return "word"  # стандартный анализатор TfidfVectorizer
         try:
-            from nltk.stem import SnowballStemmer  # noqa: WPS433
+            import importlib  # noqa: WPS433
             import re  # noqa: WPS433
 
+            stem_mod = importlib.import_module("nltk.stem")  # type: ignore
+            SnowballStemmer = getattr(stem_mod, "SnowballStemmer")
             # используем список стоп-слов из sklearn, чтобы не тянуть nltk.corpus
             from sklearn.feature_extraction.text import (
                 ENGLISH_STOP_WORDS,
@@ -594,11 +146,11 @@ def build_pipeline(
                 return [stemmer.stem(t) for t in tokens]
 
             return analyzer
-        except Exception:
+        except ModuleNotFoundError:
             # если nltk не установлен — тихо пропускаем стемминг
             return "word"
 
-    if model_name == "logreg":  # без SVD, расширяем max_features, float32
+    if model_kind is ModelKind.logreg:  # без SVD, расширяем max_features, float32
         text_max_features = trial.suggest_int(
             "tfidf_max_features", 5000, 15000, step=1000
         )
@@ -653,7 +205,7 @@ def build_pipeline(
     )
     steps = [("pre", preprocessor)]
 
-    if model_name == "logreg":
+    if model_kind is ModelKind.logreg:
         C = trial.suggest_float("logreg_C", 1e-4, 1e2, log=True)
         # Если fixed_solver задан, фиксируем выбор в trial через single-choice
         if fixed_solver is not None:
@@ -678,7 +230,7 @@ def build_pipeline(
             solver=solver,
             penalty=penalty,
         )
-    elif model_name == "rf":
+    elif model_kind is ModelKind.rf:
         n_estimators = trial.suggest_int("rf_n_estimators", 100, 300, step=50)
         max_depth = trial.suggest_int("rf_max_depth", 6, 18, step=2)
         min_samples_split = trial.suggest_int("rf_min_samples_split", 2, 10)
@@ -692,14 +244,14 @@ def build_pipeline(
             class_weight="balanced_subsample",
             random_state=SEED,
         )
-    elif model_name == "mlp":
+    elif model_kind is ModelKind.mlp:
         hidden = trial.suggest_int("mlp_hidden", 64, 256, step=64)
         epochs = trial.suggest_int("mlp_epochs", 3, 8)
         lr = trial.suggest_float("mlp_lr", 1e-4, 5e-3, log=True)
         # обязателен dense
         steps.append(("to_dense", DenseTransformer()))
         clf = SimpleMLP(hidden_dim=hidden, epochs=epochs, lr=lr, device=TRAIN_DEVICE)
-    elif model_name == "distilbert":
+    elif model_kind is ModelKind.distilbert:
         pass  # уже обработан выше
     else:  # hist_gb
         lr = trial.suggest_float("hist_gb_lr", 0.01, 0.3, log=True)
@@ -749,20 +301,22 @@ def log_confusion_matrix(y_true, y_pred, path: Path):
 
 def objective(
     trial: optuna.Trial,
-    model_name: str,
+    model_name,
     X_train,
     y_train,
     X_val,
     y_val,
     fixed_solver: Optional[str] = None,
 ):
+    model_kind: ModelKind = (
+        model_name if isinstance(model_name, ModelKind) else ModelKind(str(model_name))
+    )
     trial.set_user_attr(
         "numeric_cols", [c for c in NUMERIC_COLS if c in X_train.columns]
     )
-    # Если distilbert – обучаем напрямую без ColumnTransformer: используем только текстовую колонку
-    if model_name == "distilbert":
-        # Текстовая модель; поддержим CV при N_FOLDS>1
-        mlflow.log_param("model", model_name)
+    # Если distilbert – обучаем напрямую без ColumnTransformer
+    if model_kind is ModelKind.distilbert:
+        mlflow.log_param("model", model_kind.value)
         try:
             if N_FOLDS > 1:
                 from sklearn.model_selection import StratifiedKFold
@@ -773,7 +327,7 @@ def objective(
                 for tr_idx, va_idx in skf.split(texts, y_train):
                     X_tr, X_va = texts[tr_idx], texts[va_idx]
                     y_tr, y_va = y_train[tr_idx], y_train[va_idx]
-                    pipe = build_pipeline(trial, model_name, fixed_solver)
+                    pipe = build_pipeline(trial, model_kind, fixed_solver)
                     pipe.fit(X_tr, y_tr)
                     preds_fold = pipe.predict(X_va)
                     f1_scores.append(f1_score(y_va, preds_fold, average="macro"))
@@ -781,7 +335,7 @@ def objective(
                 mlflow.log_metric("cv_f1_macro", mean_f1)
                 return mean_f1
             else:
-                clf_pipe = build_pipeline(trial, model_name, fixed_solver)
+                clf_pipe = build_pipeline(trial, model_kind, fixed_solver)
                 clf_pipe.fit(X_train["reviewText"], y_train)
                 preds = clf_pipe.predict(X_val["reviewText"])
                 metrics = compute_metrics(y_val, preds)
@@ -800,20 +354,20 @@ def objective(
         for tr_idx, val_idx in skf.split(X_train, y_train):
             X_tr, X_va = X_train.iloc[tr_idx], X_train.iloc[val_idx]
             y_tr, y_va = y_train[tr_idx], y_train[val_idx]
-            pipe = build_pipeline(trial, model_name, fixed_solver)
+            pipe = build_pipeline(trial, model_kind, fixed_solver)
             pipe.fit(X_tr, y_tr)
             preds_fold = pipe.predict(X_va)
             f1_scores.append(f1_score(y_va, preds_fold, average="macro"))
         mean_f1 = float(np.mean(f1_scores))
-        mlflow.log_param("model", model_name)
+        mlflow.log_param("model", model_kind.value)
         mlflow.log_metric("cv_f1_macro", mean_f1)
         return mean_f1
     else:
-        pipe = build_pipeline(trial, model_name, fixed_solver)
+        pipe = build_pipeline(trial, model_kind, fixed_solver)
         pipe.fit(X_train, y_train)
         preds = pipe.predict(X_val)
         metrics = compute_metrics(y_val, preds)
-        mlflow.log_param("model", model_name)
+        mlflow.log_param("model", model_kind.value)
         mlflow.log_metrics(metrics)
         return metrics["f1_macro"]
 
@@ -878,13 +432,17 @@ def _extract_feature_importances(
         for i in top_idx:
             if i < len(feature_names):
                 res.append({"feature": feature_names[i], "importance": float(coefs[i])})
-    except Exception as e:  # noqa: BLE001
+    except (KeyError, AttributeError, ValueError) as e:  # noqa: TRY302
         log.warning("Не удалось извлечь важности: %s", e)
     return res
 
 
 def run():
-    set_seeds()
+    # Настраиваем логирование для обучения
+    from .logging_config import setup_training_logging
+
+    training_log = setup_training_logging()
+
     model_dir = Path(MODEL_DIR)
     model_dir.mkdir(parents=True, exist_ok=True)
     best_path = model_dir / "best_model.joblib"
@@ -917,20 +475,14 @@ def run():
         )
 
         # версии библиотек
-        try:
-            import sklearn  # type: ignore
-            import pandas as _pd  # noqa: F401
-
-            mlflow.log_params(
-                {
-                    "version_sklearn": sklearn.__version__,
-                    "version_optuna": optuna.__version__,
-                    "version_mlflow": mlflow.__version__,
-                    "version_pandas": _pd.__version__,
-                }
-            )
-        except Exception:  # noqa: BLE001
-            pass
+        mlflow.log_params(
+            {
+                "version_sklearn": sklearn.__version__,
+                "version_optuna": optuna.__version__,
+                "version_mlflow": mlflow.__version__,
+                "version_pandas": pd.__version__,
+            }
+        )
 
         # baseline статистики числовых признаков
         baseline_stats: Dict[str, Dict[str, float]] = {}
@@ -943,11 +495,11 @@ def run():
         mlflow.log_artifact(str(bs_path))
 
         # Перебираем модели и оптимизируем каждую в своей study
-        per_model_results: Dict[str, Dict[str, object]] = {}
+        per_model_results: Dict[ModelKind, Dict[str, object]] = {}
         # Расширяем цели поиска: для logreg создаём отдельные study по solver, чтобы избежать динамики дистрибуций в одной study
-        search_targets: List[Tuple[str, Optional[str]]] = []
+        search_targets: List[Tuple[ModelKind, Optional[str]]] = []
         for model_name in MODEL_CHOICES:
-            if model_name == "logreg":
+            if model_name is ModelKind.logreg:
                 search_targets.extend(
                     [
                         (model_name, "lbfgs"),
@@ -960,8 +512,8 @@ def run():
 
         for model_name, fixed_solver in search_targets:
             pruner = optuna.pruners.MedianPruner(n_warmup_steps=5)
-            study_name = f"{STUDY_BASE_NAME}_{model_name}{('_' + fixed_solver) if fixed_solver else ''}_{_model_sig}"
-            with mlflow.start_run(nested=True, run_name=f"model={model_name}"):
+            study_name = f"{STUDY_BASE_NAME}_{model_name.value}{('_' + fixed_solver) if fixed_solver else ''}_{_model_sig}"
+            with mlflow.start_run(nested=True, run_name=f"model={model_name.value}"):
                 study = optuna.create_study(
                     direction="maximize",
                     pruner=pruner,
@@ -971,15 +523,12 @@ def run():
                 )
                 # Прозрачность рестартов: логируем имя study и текущее число завершённых trial'ов
                 mlflow.log_param("study_name", study_name)
-                try:
-                    mlflow.log_param(
-                        "existing_trials",
-                        len([t for t in study.trials if t.value is not None]),
-                    )
-                except Exception:
-                    pass
+                mlflow.log_param(
+                    "existing_trials",
+                    len([t for t in study.trials if t.value is not None]),
+                )
 
-                def opt_obj(trial):
+                def opt_obj(trial, model_name=model_name, fixed_solver=fixed_solver):
                     with mlflow.start_run(nested=True):
                         return objective(
                             trial,
@@ -1005,7 +554,7 @@ def run():
                     )
 
                 if not study.best_trial or study.best_trial.value is None:
-                    log.warning(f"{model_name}: нет успешных trial'ов — пропуск")
+                    log.warning("%s: нет успешных trial'ов — пропуск", model_name.value)
                 else:
                     # сохраняем лучший результат по каждой модели (включая разные solvers) как максимум
                     cur = per_model_results.get(model_name)
@@ -1025,9 +574,9 @@ def run():
         best_model = max(per_model_results.items(), key=lambda x: x[1]["best_value"])[0]
         best_info = per_model_results[best_model]
         log.info(
-            f"Лучшая модель: {best_model} (val_f1_macro={best_info['best_value']:.4f})"
+            "Лучшая модель: %s (val_f1_macro=%.4f)", best_model, best_info["best_value"]
         )
-        mlflow.log_param("best_model", best_model)
+        mlflow.log_param("best_model", best_model.value)
         mlflow.log_params({f"best_{k}": v for k, v in best_info["best_params"].items()})
         mlflow.log_metric("best_val_f1_macro", best_info["best_value"])
 
@@ -1043,19 +592,11 @@ def run():
                     "numeric_cols": [c for c in NUMERIC_COLS if c in X_full.columns]
                 }
 
-            def suggest_int(self, name, _low, _high, step=1):
+            def suggest_int(self, name, _low, _high, **_kwargs):  # noqa: ANN001
                 return self.params[name]
 
-            def suggest_float(
-                self,
-                name,
-                _low,
-                _high,
-                step=None,
-                log=False,
-                log_scale=False,
-            ):
-                # Игнорируем дополнительные параметры (step/log/log_scale),
+            def suggest_float(self, name, _low, _high, **_kwargs):  # noqa: ANN001
+                # Игнорируем дополнительные параметры (step/log/log_scale и т.п.),
                 # так как возвращаем сохранённое значение из best_params
                 return self.params[name]
 
@@ -1069,7 +610,7 @@ def run():
             def user_attrs(self):
                 return self._attrs
 
-        if best_model == "distilbert":
+        if best_model is ModelKind.distilbert:
             epochs = best_params.get("db_epochs", 2)
             lr = best_params.get("db_lr", 2e-5)
             max_len = best_params.get("db_max_len", 160)
@@ -1090,7 +631,7 @@ def run():
         mlflow.log_artifact(str(best_path))
 
         # Test evaluation
-        if best_model == "distilbert":
+        if best_model is ModelKind.distilbert:
             test_preds = final_pipeline.predict(X_test["reviewText"])
         else:
             test_preds = final_pipeline.predict(X_test)
@@ -1129,7 +670,7 @@ def run():
         }
         with open(model_dir / "best_model_meta.json", "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
-        log.info(f"Завершено. Лучшая модель сохранена: {best_path}")
+    log.info("Завершено. Лучшая модель сохранена: %s", best_path)
 
 
 if __name__ == "__main__":

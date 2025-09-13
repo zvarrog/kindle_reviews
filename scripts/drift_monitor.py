@@ -11,7 +11,7 @@ import json
 import argparse
 import numpy as np
 import pandas as pd
-from scripts.config import PROCESSED_DATA_DIR, MODEL_DIR
+from scripts.settings import PROCESSED_DATA_DIR, MODEL_DIR
 from scripts.train import NUMERIC_COLS
 
 

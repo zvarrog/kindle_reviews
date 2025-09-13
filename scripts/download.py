@@ -12,17 +12,18 @@ from pathlib import Path
 from zipfile import ZipFile
 import logging
 import pandas as pd
-from config import (
+from scripts.settings import (
     FORCE_DOWNLOAD,
     KAGGLE_DATASET,
     CSV_NAME,
     RAW_DATA_DIR,
-    ZIP_FILENAME,
-    CSV_PATH,
 )
 
+ZIP_FILENAME = RAW_DATA_DIR / "kindle-reviews.zip"
+CSV_PATH = RAW_DATA_DIR / CSV_NAME
 
-def remove_leading_index_column(csv_path: str = CSV_PATH) -> None:
+
+def remove_leading_index_column(csv_path: Path = CSV_PATH) -> None:
     """
     Удаляет лишний первый столбец-индекс в CSV.
 
@@ -32,16 +33,18 @@ def remove_leading_index_column(csv_path: str = CSV_PATH) -> None:
     Args:
         csv_path (str): путь к CSV-файлу (по умолчанию используется CSV_PATH из config.py).
     """
-    df = pd.read_csv(csv_path)
+    df = pd.read_csv(str(csv_path))
     first_col = str(df.columns[0])
     if first_col in ("", "_c0"):
         df.drop(df.columns[0], axis=1).to_csv(csv_path, index=False)
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger(__name__)
+# Используем централизованное логирование
+from .logging_config import get_logger
 
-if Path(CSV_PATH).exists() and not FORCE_DOWNLOAD:
+log = get_logger("DOWNLOADER")
+
+if CSV_PATH.exists() and not FORCE_DOWNLOAD:
     log.warning(
         "%s уже существует в %s, пропуск скачивания. Для форсированного скачивания установите флаг FORCE_DOWNLOAD = True в config.py.",
         CSV_NAME,
@@ -57,7 +60,7 @@ else:
                 "-d",
                 KAGGLE_DATASET,
                 "-p",
-                RAW_DATA_DIR,
+                str(RAW_DATA_DIR),
             ],
             check=True,
         )
@@ -69,12 +72,12 @@ else:
         )
         raise
 
-    with ZipFile(ZIP_FILENAME, "r") as zip_ref:
-        zip_ref.extract(CSV_NAME, RAW_DATA_DIR)
+    with ZipFile(str(ZIP_FILENAME), "r") as zip_ref:
+        zip_ref.extract(CSV_NAME, str(RAW_DATA_DIR))
 
-    Path(ZIP_FILENAME).unlink()
+    ZIP_FILENAME.unlink()
 
     # Удаление первого столбца (индекс)
     remove_leading_index_column()
 
-    log.info("Абсолютный путь к CSV: %s", str(Path(CSV_PATH).resolve()))
+    log.info("Абсолютный путь к CSV: %s", str(CSV_PATH.resolve()))
