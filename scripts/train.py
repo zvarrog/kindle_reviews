@@ -88,7 +88,6 @@ def _configure_mlflow_tracking() -> None:
 
     original_uri = os.environ.get("MLFLOW_TRACKING_URI", "")
     log.info(f"MLflow URI до обработки: '{original_uri}'")
-
     # Принудительно устанавливаем безопасный путь в контейнере
     airflow_mlruns = Path("/opt/airflow/mlruns")
     if airflow_mlruns.exists():
