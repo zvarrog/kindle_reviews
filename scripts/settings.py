@@ -1,5 +1,4 @@
 from pathlib import Path
-import logging
 import os
 from types import SimpleNamespace
 from scripts.models.kinds import ModelKind
@@ -61,6 +60,20 @@ N_FOLDS: int = int(os.getenv("N_FOLDS", "1"))  # k-fold валидация, по
 TRAIN_DEVICE: str = os.getenv("TRAIN_DEVICE", "cuda")  # устройство для NN
 EARLY_STOP_PATIENCE: int = int(os.getenv("EARLY_STOP_PATIENCE", "10"))
 OPTUNA_TIMEOUT_SEC: int = int(os.getenv("OPTUNA_TIMEOUT_SEC", "300"))
+
+# Настройки памяти и оптимизации
+MEMORY_WARNING_MB: int = int(
+    os.getenv("MEMORY_WARNING_MB", "2048")
+)  # лимит предупреждения о памяти
+TFIDF_MAX_FEATURES_MIN: int = int(
+    os.getenv("TFIDF_MAX_FEATURES_MIN", "500")
+)  # минимум для TF-IDF
+TFIDF_MAX_FEATURES_MAX: int = int(
+    os.getenv("TFIDF_MAX_FEATURES_MAX", "2000")
+)  # максимум для TF-IDF
+FORCE_SVD_THRESHOLD_MB: int = int(
+    os.getenv("FORCE_SVD_THRESHOLD_MB", "1500")
+)  # принудительно включать SVD при превышении
 
 # Используем централизованную систему логирования
 from .logging_config import get_logger

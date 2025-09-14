@@ -20,7 +20,6 @@ import joblib
 import hashlib
 import os
 import time
-import random
 from typing import Optional, Dict, Tuple, List
 import numpy as np
 import pandas as pd
@@ -29,15 +28,13 @@ import mlflow
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.decomposition import TruncatedSVD
-from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
-from sklearn.model_selection import train_test_split, StratifiedKFold
 from scripts.settings import (
     SEED,
-    PROCESSED_DATA_DIR,
     MODEL_DIR,
     FORCE_TRAIN,
     OPTUNA_N_TRIALS,
@@ -49,6 +46,9 @@ from scripts.settings import (
     TRAIN_DEVICE,
     EARLY_STOP_PATIENCE,
     OPTUNA_TIMEOUT_SEC,
+    TFIDF_MAX_FEATURES_MIN,
+    TFIDF_MAX_FEATURES_MAX,
+    FORCE_SVD_THRESHOLD_MB,
 )
 from scripts.train_modules.data_loading import load_splits
 from scripts.train_modules.feature_space import NUMERIC_COLS, DenseTransformer
@@ -56,12 +56,7 @@ from scripts.train_modules.models import SimpleMLP
 from scripts.models.distilbert import DistilBertClassifier
 from scripts.models.kinds import ModelKind
 
-from scripts.train_modules.tuning import objective, run_optuna_study
-from scripts.train_modules.evaluation import (
-    compute_metrics,
-    log_confusion_matrix,
-    get_classification_report,
-)
+# локальные реализации метрик и визуализаций ниже
 from sklearn.metrics import (
     f1_score,
     accuracy_score,
@@ -80,6 +75,49 @@ _model_sig = hashlib.md5(
     )
 ).hexdigest()[:8]
 OPTUNA_STUDY_NAME = f"{STUDY_BASE_NAME}_{_model_sig}"
+
+
+def _configure_mlflow_tracking() -> None:
+    """Устанавливает безопасный file-store для MLflow внутри контейнера/локально.
+
+    Цели:
+    - Избежать утечки Windows-путей вида 'C:\\...' в Linux-контейнере (ошибка '/C:').
+    - Явно проставить file-store, если переменная не задана.
+    """
+    import re
+
+    original_uri = os.environ.get("MLFLOW_TRACKING_URI", "")
+    log.info(f"MLflow URI до обработки: '{original_uri}'")
+    
+    # Принудительно устанавливаем безопасный путь в контейнере
+    airflow_mlruns = Path("/opt/airflow/mlruns")
+    if airflow_mlruns.exists():
+        target = "file:/opt/airflow/mlruns"
+        log.info("Обнаружен /opt/airflow/mlruns, принудительно устанавливаю MLflow URI")
+    else:
+        local = Path("mlruns").resolve()
+        local.mkdir(parents=True, exist_ok=True)
+        target = f"file:{local.as_posix()}"
+        log.info(f"Создаю локальный mlruns: {local}")
+    
+    # Принудительно устанавливаем и логируем
+    os.environ["MLFLOW_TRACKING_URI"] = target
+    mlflow.set_tracking_uri(target)
+    
+    # Проверяем, что MLflow действительно использует правильный URI
+    actual_uri = mlflow.get_tracking_uri()
+    log.info(f"MLflow URI после установки: '{target}' -> MLflow видит: '{actual_uri}'")
+    
+    # Дополнительная проверка: убедимся, что artifact_uri тоже корректный
+    try:
+        # Создаём временный run чтобы проверить artifact_uri
+        with mlflow.start_run(run_name="tracking_uri_test") as run:
+            artifact_uri = run.info.artifact_uri
+            log.info(f"Тестовый artifact_uri: '{artifact_uri}'")
+            # Немедленно завершаем тестовый run
+        mlflow.end_run()
+    except Exception as e:
+        log.warning(f"Не удалось проверить artifact_uri: {e}")
 
 
 def build_pipeline(
@@ -152,7 +190,10 @@ def build_pipeline(
 
     if model_kind is ModelKind.logreg:  # без SVD, расширяем max_features, float32
         text_max_features = trial.suggest_int(
-            "tfidf_max_features", 1000, 6000, step=500
+            "tfidf_max_features",
+            TFIDF_MAX_FEATURES_MIN,
+            TFIDF_MAX_FEATURES_MAX,
+            step=250,
         )
         tfidf = TfidfVectorizer(
             max_features=text_max_features,
@@ -165,11 +206,34 @@ def build_pipeline(
         text_steps = [("tfidf", tfidf)]
     else:
         text_max_features = trial.suggest_int(
-            "tfidf_max_features", 1000, 6000, step=500
+            "tfidf_max_features",
+            TFIDF_MAX_FEATURES_MIN,
+            TFIDF_MAX_FEATURES_MAX,
+            step=250,
         )
-        use_svd = trial.suggest_categorical("use_svd", [False, True])
-        if use_svd:
+
+        # Оценка потенциального размера матрицы и принудительное включение SVD
+        estimated_size_mb = (text_max_features * 20000 * 4) / (
+            1024 * 1024
+        )  # примерная оценка для float32
+        force_svd = estimated_size_mb > FORCE_SVD_THRESHOLD_MB
+
+        if force_svd:
+            log.warning(
+                "Принудительно включаю SVD: оценочный размер матрицы %.1f MB > %d MB",
+                estimated_size_mb,
+                FORCE_SVD_THRESHOLD_MB,
+            )
+            use_svd = True
             svd_components = trial.suggest_int("svd_components", 20, 100, step=20)
+        else:
+            use_svd = trial.suggest_categorical("use_svd", [False, True])
+            if use_svd:
+                svd_components = trial.suggest_int("svd_components", 20, 100, step=20)
+            else:
+                svd_components = (
+                    None  # Значение по умолчанию, когда SVD не используется
+                )
         tfidf = TfidfVectorizer(
             max_features=text_max_features,
             ngram_range=(1, 2),
@@ -178,7 +242,7 @@ def build_pipeline(
             analyzer=_maybe_stemming_analyzer(),
         )
         text_steps = [("tfidf", tfidf)]
-        if use_svd:
+        if use_svd and svd_components is not None:
             text_steps.append(
                 ("svd", TruncatedSVD(n_components=svd_components, random_state=SEED))
             )
@@ -441,7 +505,10 @@ def run():
     # Настраиваем логирование для обучения
     from .logging_config import setup_training_logging
 
-    training_log = setup_training_logging()
+    setup_training_logging()
+
+    # Настройка MLflow трекинга до любых логов
+    _configure_mlflow_tracking()
 
     model_dir = Path(MODEL_DIR)
     model_dir.mkdir(parents=True, exist_ok=True)
