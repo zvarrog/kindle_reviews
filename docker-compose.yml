@@ -20,23 +20,32 @@ services:
     build:
       context: .
       dockerfile: docker/airflow/dockerfile
+    user: root
     environment:
       AIRFLOW__CORE__EXECUTOR: SequentialExecutor
       AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: 'postgresql+psycopg2://admin:admin@postgres:5432/airflow_meta'
       OPTUNA_STORAGE: 'postgresql+psycopg2://admin:admin@postgres:5432/optuna'
+      MLFLOW_TRACKING_URI: 'file:/opt/airflow/mlruns'
       JAVA_HOME: /usr/lib/jvm/default-java
       PYTHONPATH: /opt/airflow
       FORCE_DOWNLOAD: '0'
       FORCE_PROCESS: '0'
       FORCE_TRAIN: '0'
+      # Оптимизация памяти
+      MEMORY_WARNING_MB: '2048'
+      TFIDF_MAX_FEATURES_MIN: '500'
+      TFIDF_MAX_FEATURES_MAX: '2000'
+      FORCE_SVD_THRESHOLD_MB: '1500'
+      OPTUNA_N_TRIALS: '20'
+      PER_CLASS_LIMIT: '15000'
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./scripts:/opt/airflow/scripts:ro
       - ./data/raw:/opt/airflow/data/raw
       - ./data/processed:/opt/airflow/data/processed
       - ./model:/opt/airflow/model
-      - ./mlruns:/opt/airflow/mlruns
+      - mlruns_data:/opt/airflow/mlruns
       - ${USERPROFILE}/.kaggle/kaggle.json:/home/airflow/.kaggle/kaggle.json:ro
     ports:
       - '8080:8080'
@@ -79,3 +88,4 @@ services:
 
 volumes:
   pgdata:
+  mlruns_data:

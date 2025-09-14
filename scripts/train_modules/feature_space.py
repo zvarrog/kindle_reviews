@@ -2,7 +2,7 @@
 Модуль обработки признаков для обучения моделей.
 """
 
-import numpy as np
+import gc
 from sklearn.base import BaseEstimator, TransformerMixin
 import logging
 
@@ -19,7 +19,9 @@ NUMERIC_COLS = [
     "item_review_count",
 ]
 
-MEM_WARN_MB = 1024.0  # Можно централизовать через settings
+from scripts.settings import log, MEMORY_WARNING_MB
+
+MEM_WARN_MB = MEMORY_WARNING_MB
 
 
 class DenseTransformer(TransformerMixin, BaseEstimator):
@@ -42,4 +44,8 @@ class DenseTransformer(TransformerMixin, BaseEstimator):
                 size_mb,
                 MEM_WARN_MB,
             )
+            # Принудительная очистка памяти для критически больших матриц
+            if size_mb > MEM_WARN_MB * 1.5:
+                gc.collect()
+                log.info("Выполнена принудительная очистка памяти (garbage collection)")
         return arr
