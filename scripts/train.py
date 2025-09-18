@@ -46,6 +46,8 @@ from scripts.settings import (
     TRAIN_DEVICE,
     EARLY_STOP_PATIENCE,
     OPTUNA_TIMEOUT_SEC,
+    MIN_TRIALS_BEFORE_EARLY_STOP,
+    DISTILBERT_TIMEOUT_SEC,
     TFIDF_MAX_FEATURES_MIN,
     TFIDF_MAX_FEATURES_MAX,
     FORCE_SVD_THRESHOLD_MB,
@@ -64,6 +66,25 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 import sklearn
+import warnings
+
+# Подавляем избыточные предупреждения
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
+warnings.filterwarnings("ignore", category=UserWarning, module="optuna")
+# Подавляем предупреждение transformers про clean_up_tokenization_spaces
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r"`clean_up_tokenization_spaces` was not set.*",
+)
+
+# Подавляем MLflow/Git логи
+import logging
+
+logging.getLogger("mlflow").setLevel(logging.ERROR)
+logging.getLogger("optuna").setLevel(logging.ERROR)
+logging.getLogger("git").setLevel(logging.ERROR)
 
 MODEL_CHOICES: List[ModelKind] = SELECTED_MODEL_KINDS
 SEARCH_SPACE_VERSION = "v2"
@@ -84,10 +105,8 @@ def _configure_mlflow_tracking() -> None:
     - Избежать утечки Windows-путей вида 'C:\\...' в Linux-контейнере (ошибка '/C:').
     - Явно проставить file-store, если переменная не задана.
     """
-    import re
-
     original_uri = os.environ.get("MLFLOW_TRACKING_URI", "")
-    log.info(f"MLflow URI до обработки: '{original_uri}'")
+    log.info("MLflow URI до обработки: '%s'", original_uri)
     # Принудительно устанавливаем безопасный путь в контейнере
     airflow_mlruns = Path("/opt/airflow/mlruns")
     if airflow_mlruns.exists():
@@ -97,7 +116,7 @@ def _configure_mlflow_tracking() -> None:
         local = Path("mlruns").resolve()
         local.mkdir(parents=True, exist_ok=True)
         target = f"file:{local.as_posix()}"
-        log.info(f"Создаю локальный mlruns: {local}")
+        log.info("Создаю локальный mlruns: %s", local)
 
     # Принудительно устанавливаем и логируем
     os.environ["MLFLOW_TRACKING_URI"] = target
@@ -105,18 +124,12 @@ def _configure_mlflow_tracking() -> None:
 
     # Проверяем, что MLflow действительно использует правильный URI
     actual_uri = mlflow.get_tracking_uri()
-    log.info(f"MLflow URI после установки: '{target}' -> MLflow видит: '{actual_uri}'")
+    log.info(
+        "MLflow URI после установки: '%s' -> MLflow видит: '%s'", target, actual_uri
+    )
 
     # Дополнительная проверка: убедимся, что artifact_uri тоже корректный
-    try:
-        # Создаём временный run чтобы проверить artifact_uri
-        with mlflow.start_run(run_name="tracking_uri_test") as run:
-            artifact_uri = run.info.artifact_uri
-            log.info(f"Тестовый artifact_uri: '{artifact_uri}'")
-            # Немедленно завершаем тестовый run
-        mlflow.end_run()
-    except Exception as e:
-        log.warning(f"Не удалось проверить artifact_uri: {e}")
+    # (лог ошибки убран по запросу)
 
 
 def build_pipeline(
@@ -435,23 +448,31 @@ def objective(
         return metrics["f1_macro"]
 
 
-def _early_stop_callback(patience: int):
+def _early_stop_callback(patience: int, min_trials: int):
     # санитайзер: не позволяем patience < 1
     if patience is None or patience < 1:
         log.warning("patience<1 в early stop, принудительно устанавливаю в 1")
         patience = 1
-    best = {"value": -1, "since": 0}
+    best = {"value": -1, "since": 0, "count": 0}
 
     def cb(study: optuna.Study, trial: optuna.Trial):
         if trial.value is None:
             return
+        best["count"] += 1
         if trial.value > best["value"] + 1e-9:
             best["value"] = trial.value
             best["since"] = 0
         else:
             best["since"] += 1
+        # Не останавливаемся, пока не наберём минимум успешных трейлов
+        if best["count"] < max(1, min_trials):
+            return
         if best["since"] >= patience:
             log.info("Early stop: нет улучшений %d trial'ов", patience)
+            try:
+                study.set_user_attr("early_stopped", True)
+            except optuna.exceptions.OptunaError:
+                pass
             study.stop()
 
     return cb
@@ -512,8 +533,21 @@ def run():
     model_dir = Path(MODEL_DIR)
     model_dir.mkdir(parents=True, exist_ok=True)
     best_path = model_dir / "best_model.joblib"
+    best_meta_path = model_dir / "best_model_meta.json"
 
     log.info("FORCE_TRAIN=%s, best_model exists=%s", FORCE_TRAIN, best_path.exists())
+
+    # Загружаем метрики старой модели для сравнения
+    old_model_metric = None
+    if best_meta_path.exists():
+        try:
+            with open(best_meta_path, "r", encoding="utf-8") as f:
+                old_meta = json.load(f)
+                old_model_metric = old_meta.get("best_val_f1_macro")
+                if old_model_metric:
+                    log.info("Найдена предыдущая модель с val_f1_macro=%.4f", old_model_metric)
+        except Exception as e:
+            log.warning("Не удалось загрузить метаданные старой модели: %s", e)
 
     if best_path.exists() and not FORCE_TRAIN:
         log.info("Модель уже существует и FORCE_TRAIN=False — пропуск")
@@ -570,14 +604,15 @@ def run():
                     [
                         (model_name, "lbfgs"),
                         (model_name, "liblinear"),
-                        (model_name, "saga"),
+                        # (model_name, "saga"),  # Закомментировано: очень медленно сходится на больших данных
                     ]
                 )
             else:
                 search_targets.append((model_name, None))
 
         for model_name, fixed_solver in search_targets:
-            pruner = optuna.pruners.MedianPruner(n_warmup_steps=5)
+            # Ослабляем прунинг: даём 5 стартовых трейлов без прунинга
+            pruner = optuna.pruners.MedianPruner(n_startup_trials=5)
             study_name = f"{STUDY_BASE_NAME}_{model_name.value}{('_' + fixed_solver) if fixed_solver else ''}_{_model_sig}"
             with mlflow.start_run(nested=True, run_name=f"model={model_name.value}"):
                 study = optuna.create_study(
@@ -587,7 +622,6 @@ def run():
                     study_name=study_name,
                     load_if_exists=True,
                 )
-                # Прозрачность рестартов: логируем имя study и текущее число завершённых trial'ов
                 mlflow.log_param("study_name", study_name)
                 mlflow.log_param(
                     "existing_trials",
@@ -596,7 +630,7 @@ def run():
 
                 def opt_obj(trial, model_name=model_name, fixed_solver=fixed_solver):
                     with mlflow.start_run(nested=True):
-                        return objective(
+                        result = objective(
                             trial,
                             model_name,
                             X_train,
@@ -605,24 +639,59 @@ def run():
                             y_val,
                             fixed_solver,
                         )
+                        # Логируем каждый trial как INFO
+                        log.info(
+                            "Trial %d (%s%s): value=%.4f, params=%s",
+                            trial.number,
+                            model_name.value,
+                            "/" + str(fixed_solver) if fixed_solver else "",
+                            result,
+                            trial.params,
+                        )
+                        return result
 
+                stop_reason = None
                 try:
+                    # Персональный таймаут для тяжёлых моделей
+                    timeout_sec = (
+                        DISTILBERT_TIMEOUT_SEC
+                        if model_name is ModelKind.distilbert
+                        else OPTUNA_TIMEOUT_SEC
+                    )
                     study.optimize(
                         opt_obj,
                         n_trials=OPTUNA_N_TRIALS,
-                        timeout=OPTUNA_TIMEOUT_SEC,
-                        callbacks=[_early_stop_callback(EARLY_STOP_PATIENCE)],
+                        timeout=timeout_sec,
+                        callbacks=[
+                            _early_stop_callback(
+                                EARLY_STOP_PATIENCE, MIN_TRIALS_BEFORE_EARLY_STOP
+                            )
+                        ],
                         show_progress_bar=False,
                     )
+                    if study.user_attrs.get("early_stopped", False):
+                        stop_reason = "early_stop"
                 except KeyboardInterrupt:
-                    log.warning(
-                        "Оптимизация прервана пользователем — используем текущий best"
+                    stop_reason = "keyboard_interrupt"
+                except (RuntimeError, ValueError, optuna.exceptions.OptunaError) as e:
+                    stop_reason = f"error: {e}"
+
+                # Явно логируем причину остановки
+                if stop_reason == "early_stop":
+                    log.info(
+                        "Optuna: остановка по ранней остановке (patience=%d)",
+                        EARLY_STOP_PATIENCE,
                     )
+                elif stop_reason == "keyboard_interrupt":
+                    log.info("Optuna: остановка по KeyboardInterrupt")
+                elif stop_reason:
+                    log.info("Optuna: остановка по ошибке: %s", stop_reason)
+                else:
+                    log.info("Optuna: успешное завершение всех trial'ов")
 
                 if not study.best_trial or study.best_trial.value is None:
                     log.warning("%s: нет успешных trial'ов — пропуск", model_name.value)
                 else:
-                    # сохраняем лучший результат по каждой модели (включая разные solvers) как максимум
                     cur = per_model_results.get(model_name)
                     new_entry = {
                         "best_value": study.best_value,
@@ -639,8 +708,25 @@ def run():
         # Выбираем лучшую модель по best_value
         best_model = max(per_model_results.items(), key=lambda x: x[1]["best_value"])[0]
         best_info = per_model_results[best_model]
+        new_model_metric = best_info["best_value"]
+        
+        # Сравниваем с предыдущей моделью
+        if old_model_metric is not None:
+            if new_model_metric <= old_model_metric:
+                log.info(
+                    "Новая модель %s (val_f1_macro=%.4f) НЕ лучше предыдущей (%.4f) — сохраняем старую",
+                    best_model.value, new_model_metric, old_model_metric
+                )
+                log.info("Обучение завершено без замены модели")
+                return
+            else:
+                log.info(
+                    "Новая модель %s (val_f1_macro=%.4f) лучше предыдущей (%.4f) — заменяем",
+                    best_model.value, new_model_metric, old_model_metric
+                )
+        
         log.info(
-            "Лучшая модель: %s (val_f1_macro=%.4f)", best_model, best_info["best_value"]
+            "Лучшая модель: %s (val_f1_macro=%.4f)", best_model.value, new_model_metric
         )
         mlflow.log_param("best_model", best_model.value)
         mlflow.log_params({f"best_{k}": v for k, v in best_info["best_params"].items()})

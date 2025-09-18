@@ -143,6 +143,9 @@ def get_logging_config(
             "urllib3": {"level": "WARNING"},
             "pyspark": {"level": "WARNING"},
             "py4j": {"level": "WARNING"},
+            "mlflow": {"level": "ERROR"},  # Убираем INFO/WARNING от MLflow
+            "optuna": {"level": "ERROR"},  # Убираем INFO/WARNING от Optuna
+            "git": {"level": "ERROR"},     # Убираем предупреждения git
         },
     }
 

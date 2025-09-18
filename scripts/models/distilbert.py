@@ -75,6 +75,7 @@ class DistilBertClassifier(BaseEstimator, ClassifierMixin):
                     truncation=True,
                     padding=True,
                     max_length=self.max_len,
+                    clean_up_tokenization_spaces=False,
                     return_tensors="pt",
                 )
                 enc = {k: v.to(device) for k, v in enc.items()}
@@ -108,6 +109,7 @@ class DistilBertClassifier(BaseEstimator, ClassifierMixin):
                 truncation=True,
                 padding=True,
                 max_length=self.max_len,
+                clean_up_tokenization_spaces=False,
                 return_tensors="pt",
             )
             enc = {k: v.to(device) for k, v in enc.items()}

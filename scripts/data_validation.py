@@ -307,17 +307,20 @@ def validate_parquet_file(
             import numpy as np
 
             try:
-                # Преобразуем все столбцы с массивами в tuple
+                # Преобразуем все нехэшируемые типы в хэшируемые
                 df_for_dupes = df.copy()
                 for col in df_for_dupes.columns:
-                    if (
-                        df_for_dupes[col]
-                        .apply(lambda x: isinstance(x, np.ndarray))
-                        .any()
-                    ):
-                        df_for_dupes[col] = df_for_dupes[col].apply(
-                            lambda x: tuple(x) if isinstance(x, np.ndarray) else x
+                    # Проверяем первые несколько значений на нехэшируемые типы
+                    sample_vals = df_for_dupes[col].dropna().head(10)
+                    if len(sample_vals) > 0:
+                        has_unhashable = any(
+                            isinstance(x, (np.ndarray, dict, list, set))
+                            for x in sample_vals
                         )
+                        if has_unhashable:
+                            df_for_dupes[col] = df_for_dupes[col].apply(
+                                lambda x: str(x) if x is not None else None
+                            )
                 duplicates = df_for_dupes.duplicated().sum()
                 if duplicates > 0:
                     warnings.append(f"Найдено {duplicates} дублированных строк")

@@ -55,9 +55,10 @@ class SimpleMLP(BaseEstimator, ClassifierMixin):
 
         _TORCH.Generator().manual_seed(self.seed)
         device_str = _select_device(self._device)
-        log.info(
-            f"SimpleMLP: обучение на устройстве {device_str}"
-        )  # Логируем устройство
+        # Логируем устройство только один раз за запуск
+        if not hasattr(self, "_device_logged"):
+            log.info(f"SimpleMLP: обучение на устройстве {device_str}")
+            self._device_logged = True
         device = _TORCH.device(device_str)
         unique_labels = np.unique(y)
         self._classes_ = unique_labels

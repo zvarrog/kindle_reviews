@@ -39,6 +39,8 @@ services:
       FORCE_SVD_THRESHOLD_MB: '1500'
       OPTUNA_N_TRIALS: '20'
       PER_CLASS_LIMIT: '15000'
+      # Убираем избыточные логи
+      GIT_PYTHON_REFRESH: 'quiet'
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./scripts:/opt/airflow/scripts:ro
@@ -65,6 +67,11 @@ services:
       resources:
         limits:
           memory: 6g
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   api:
     build:
